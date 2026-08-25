@@ -1,13 +1,17 @@
 /**
  * Mode S 1000 eligibility.
  *
- * A flight qualifies when it is Mode S capable per ICAO field 10 AND every
- * point of its route lies inside the Mode S area. The two halves are evaluated
- * separately on purpose: the geographic half depends only on the route, so it
- * is cached against the route text and shared by every flight filing it, while
- * the equipment half is per flight and costs nothing.
+ * A flight qualifies when it is Mode S capable per ICAO field 10, its
+ * destination is in a participating state, and the REMAINING route -- from
+ * where the aircraft is now to the destination -- stays inside the Mode S area.
+ *
+ * Remaining, not whole. An inbound from Montreal has most of its filed route
+ * over the Atlantic and North America, but once it is over Brittany everything
+ * ahead of it is Mode S airspace and it should be squawking 1000. Judging the
+ * whole route would deny conspicuity to every long-haul arrival.
  */
 
+import { greatCircleNm } from "../geo.js";
 import type { Navdata } from "./navdata.js";
 
 /**
@@ -31,31 +35,88 @@ export function isModeSCapable(
   return [...accepted.toUpperCase()].some((letter) => surveillance.includes(letter));
 }
 
-/** Speed/level groups such as `N0450F350` or `K0880S1130`. */
-const SPEED_LEVEL = /^[KN]\d{4}[FSAM]\d{3,4}$/;
+/** Whether a destination aerodrome sits in a Mode S participating state. */
+export function destinationParticipates(
+  arrival: string | null,
+  states: ReadonlySet<string>,
+): boolean {
+  if (!arrival || arrival.length < 2) return false;
+  return states.has(arrival.slice(0, 2).toUpperCase());
+}
+
+/**
+ * Speed/level groups: `N0450F350`, `M085F400`, `K0880S1130`.
+ * Speed is knots, Mach or km/h; level is flight level, metric level or altitude.
+ */
+const SPEED_LEVEL = /^(?:[KN]\d{4}|M\d{3})[FSAM]\d{3,4}$/;
 /** Tokens that carry no position and are simply skipped. */
 const IGNORED_TOKENS = new Set(["DCT", "SID", "STAR", "IFR", "VFR"]);
 
-export type RouteVerdict =
-  | { inside: true }
-  | { inside: false; reason: string };
+/** A SID/STAR designator: a fix name, a revision number, an optional letter. */
+const DESIGNATOR = /^([A-Z]+)(\d{1,2}[A-Z]?)$/;
 
 /**
- * Whether every point of a route lies inside the Mode S area.
+ * Whether a token names a procedure published by the given aerodrome.
  *
- * Fails closed: a token that looks like a point but cannot be resolved denies
- * eligibility, because "outside the area" and "not in our data" are
- * indistinguishable here and both should yield a discrete code.
+ * ARINC 424 caps procedure identifiers at six characters and truncates the fix
+ * name to fit, so the DFD holds BIKM1A where the AIP publishes -- and the pilot
+ * files -- BIKMU1A. Matching the strings directly misses every designator that
+ * was long enough to be truncated, which is most of them: 9,212 of the 11,172
+ * we ship sit at exactly six characters.
+ *
+ * So a match requires the revision suffix to be equal and one fix name to be a
+ * prefix of the other.
  */
-export function routeStaysInside(
+function namesProcedure(token: string, designators: ReadonlySet<string> | undefined): boolean {
+  if (!designators || designators.size === 0) return false;
+  if (designators.has(token)) return true;
+
+  const m = DESIGNATOR.exec(token);
+  if (!m) return false;
+  const filedFix = m[1]!;
+  const filedSuffix = m[2]!;
+
+  for (const published of designators) {
+    const p = DESIGNATOR.exec(published);
+    if (!p || p[2] !== filedSuffix) continue;
+    const publishedFix = p[1]!;
+    if (filedFix.startsWith(publishedFix) || publishedFix.startsWith(filedFix)) return true;
+  }
+  return false;
+}
+
+/**
+ * Marks a position in the route we could not resolve to a point.
+ *
+ * Prefixed with a character no identifier contains, so it can never collide
+ * with a real fix and is never found in fix.txt. Recording it in place rather
+ * than aborting is what makes the remaining-route rule work: an airway that
+ * cannot be expanded matters only if it is still ahead of the aircraft.
+ */
+const UNRESOLVED_PREFIX = "?";
+
+export function unresolved(token: string): string {
+  return UNRESOLVED_PREFIX + token;
+}
+
+export function isUnresolved(point: string): boolean {
+  return point.startsWith(UNRESOLVED_PREFIX);
+}
+
+/**
+ * Tokenise a filed route into the points it crosses, in order.
+ *
+ * Depends only on the route text and the navdata, never on where the aircraft
+ * is, which is what lets the result be cached and shared between every flight
+ * filing the same route.
+ */
+export function expandRoute(
   navdata: Navdata,
   departure: string | null,
   arrival: string | null,
   route: string | null,
-): RouteVerdict {
-  if (!route || route.trim().length === 0) {
-    return { inside: false, reason: "no route filed" };
-  }
+): string[] {
+  if (!route || route.trim().length === 0) return [];
 
   const depProcedures = departure ? navdata.procedures.get(departure) : undefined;
   const arrProcedures = arrival ? navdata.procedures.get(arrival) : undefined;
@@ -64,7 +125,15 @@ export function routeStaysInside(
   const points: string[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i]!;
+    let token = tokens[i]!;
+
+    // Field 15 marks a speed or level change at a point as POINT/SPEEDLEVEL,
+    // for example RANUX/N0449F390. The point is what matters here.
+    const slash = token.indexOf("/");
+    if (slash > 0) {
+      const tail = token.slice(slash + 1);
+      if (SPEED_LEVEL.test(tail)) token = token.slice(0, slash);
+    }
 
     if (IGNORED_TOKENS.has(token) || SPEED_LEVEL.test(token)) continue;
 
@@ -72,7 +141,7 @@ export function routeStaysInside(
     // or destination. Matching the bare designator against every airport would
     // wrongly skip the handful of identifiers that are both a procedure name
     // and a real fix (BRAVO, HON, NORTH, ROCIO, SOUTH, TSC).
-    if (depProcedures?.has(token) || arrProcedures?.has(token)) continue;
+    if (namesProcedure(token, depProcedures) || namesProcedure(token, arrProcedures)) continue;
 
     const chains = navdata.airways.get(token);
     if (chains) {
@@ -80,7 +149,11 @@ export function routeStaysInside(
       const exit = tokens[i + 1] ?? null;
       const walked = walkAirway(chains, entry, exit);
       if (!walked) {
-        return { inside: false, reason: `airway ${token} cannot be expanded` };
+        // Cannot expand it. Leave a marker so the segment is treated as
+        // outside-or-unknown if it is still ahead of the aircraft, and ignored
+        // if it has already been flown.
+        points.push(unresolved(token));
+        continue;
       }
       // Entry and exit are contributed by the tokens either side of the airway.
       points.push(...walked.slice(1, -1));
@@ -90,12 +163,7 @@ export function routeStaysInside(
     points.push(token);
   }
 
-  for (const point of points) {
-    if (!navdata.fixes.has(point)) {
-      return { inside: false, reason: `${point} is outside the area or unknown` };
-    }
-  }
-  return { inside: true };
+  return points;
 }
 
 /**
@@ -120,28 +188,82 @@ function walkAirway(
   return null;
 }
 
+export type RemainingVerdict =
+  | { inside: true; fromIndex: number }
+  | { inside: false; reason: string };
+
 /**
- * Route verdicts keyed on the route text rather than the callsign.
+ * Whether everything still ahead of the aircraft lies inside the Mode S area.
  *
- * The same city pairs are filed with identical routes all day, so a route-keyed
- * cache hits far more often than a flight-keyed one. The cache is only valid
- * for the navdata that produced it, so it MUST be cleared whenever a config
- * snapshot is swapped in -- an AIRAC that moves an airway changes the verdict
- * for routes whose text has not changed at all.
+ * Progress along the route is estimated as the nearest point we have a position
+ * for. Only in-area points have positions -- fix.txt is clipped to the area --
+ * so the estimate is only meaningful for an aircraft that is itself in or near
+ * the area, which every flight in scope is by definition.
+ */
+export function remainingRouteInside(
+  navdata: Navdata,
+  points: readonly string[],
+  latitude: number,
+  longitude: number,
+): RemainingVerdict {
+  if (points.length === 0) return { inside: false, reason: "no route filed" };
+
+  let nearest = -1;
+  let nearestNm = Infinity;
+  for (let i = 0; i < points.length; i++) {
+    const fix = navdata.fixes.get(points[i]!);
+    if (!fix) continue;
+    const d = greatCircleNm(latitude, longitude, fix.lat, fix.lon);
+    if (d < nearestNm) {
+      nearestNm = d;
+      nearest = i;
+    }
+  }
+
+  if (nearest < 0) {
+    // Nothing on the route is inside the area, so either the flight is nowhere
+    // near it or the route is unusable. Either way, no conspicuity.
+    return { inside: false, reason: "no route point lies inside the area" };
+  }
+
+  for (let i = nearest; i < points.length; i++) {
+    const point = points[i]!;
+    if (!navdata.fixes.has(point)) {
+      return {
+        inside: false,
+        reason: isUnresolved(point)
+          ? `${point.slice(1)} ahead cannot be expanded`
+          : `${point} ahead is outside the area`,
+      };
+    }
+  }
+  return { inside: true, fromIndex: nearest };
+}
+
+/**
+ * Expanded routes keyed on the route text.
+ *
+ * Expansion is the expensive half and depends only on the text, so the same
+ * city pair filed all day costs one expansion. The remaining-route test is
+ * cheap and runs per flight, because it depends on where the aircraft is.
+ *
+ * The cache MUST be cleared whenever a config snapshot is swapped in: an
+ * expansion is only valid for the navdata that produced it, and an AIRAC that
+ * moves an airway changes the result for routes whose text has not changed.
  */
 export class RouteCache {
-  private readonly entries = new Map<string, RouteVerdict>();
+  private readonly entries = new Map<string, string[]>();
   private hits = 0;
   private misses = 0;
 
   constructor(private readonly limit = 20_000) {}
 
-  verdict(
+  expand(
     navdata: Navdata,
     departure: string | null,
     arrival: string | null,
     route: string | null,
-  ): RouteVerdict {
+  ): string[] {
     const key = `${departure ?? ""}|${(route ?? "").trim().toUpperCase().replace(/\s+/g, " ")}|${arrival ?? ""}`;
     const cached = this.entries.get(key);
     if (cached) {
@@ -149,13 +271,13 @@ export class RouteCache {
       return cached;
     }
     this.misses++;
-    const verdict = routeStaysInside(navdata, departure, arrival, route);
+    const points = expandRoute(navdata, departure, arrival, route);
     if (this.entries.size >= this.limit) {
       const oldest = this.entries.keys().next();
       if (!oldest.done) this.entries.delete(oldest.value);
     }
-    this.entries.set(key, verdict);
-    return verdict;
+    this.entries.set(key, points);
+    return points;
   }
 
   clear(): void {

@@ -148,7 +148,15 @@ interface ManualBody {
   callsign?: string;
   controller?: string;
   token?: string;
+  /** Present means "set exactly this code"; it wins over `mode`. */
   code?: string;
+  /**
+   * "auto" re-runs the server's whole decision, Mode S included, so a flight
+   * that still qualifies gets 1000 back. "discrete" forces a pool code and
+   * bypasses Mode S, which is the only way off conspicuity without typing a
+   * code by hand. Defaults to "auto".
+   */
+  mode?: "auto" | "discrete";
 }
 
 const REJECTION_STATUS: Record<string, number> = {
@@ -156,11 +164,12 @@ const REJECTION_STATUS: Record<string, number> = {
   malformed_code: 400,
   excluded_code: 409,
   not_authorised: 403,
+  pool_exhausted: 503,
 };
 
 function registerManual(app: FastifyInstance, services: Services): void {
   app.post<{ Body: ManualBody }>("/api/assign", async (req, reply) => {
-    const { callsign, controller, token, code } = req.body ?? {};
+    const { callsign, controller, token, code, mode } = req.body ?? {};
     if (!callsign || !controller) {
       return reply.code(400).send({ error: "callsign and controller are required" });
     }
@@ -171,15 +180,20 @@ function registerManual(app: FastifyInstance, services: Services): void {
       return reply.code(503).send({ error: "warming up" });
     }
 
-    // No code means "force a reassignment"; a code means "set this one".
+    const target = callsign.toUpperCase();
     const result = code
-      ? services.engine.setCode(callsign.toUpperCase(), code)
-      : services.engine.forceReassign(callsign.toUpperCase());
+      ? services.engine.setCode(target, code)
+      : mode === "discrete"
+        ? services.engine.forceDiscrete(target)
+        : services.engine.forceReassign(target);
 
     if (typeof result === "string") {
       return reply.code(REJECTION_STATUS[result] ?? 400).send({ error: result });
     }
-    req.log.info({ callsign, controller, code: result.ssr }, "manual assignment");
+    req.log.info(
+      { callsign, controller, mode: code ? "set" : (mode ?? "auto"), code: result.ssr },
+      "manual assignment",
+    );
     return reply.send(result);
   });
 }

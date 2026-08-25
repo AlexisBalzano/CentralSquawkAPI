@@ -38,6 +38,7 @@ export function makeConfig(ranges: CodeRange[], exclusions: string[] = []): Conf
       manuallyAssignable: ["7600", "7700"],
     },
     timing: { gracePeriodSec: 300, groundSpeedThresholdKt: 50, tickIntervalSec: 15 },
+    modeS: { states: ["LF", "EB", "ED", "EH", "LE", "LI", "LS"] },
     exclusions,
   };
 

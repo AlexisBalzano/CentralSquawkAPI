@@ -25,7 +25,12 @@ import type {
   Snapshot,
   Squawk,
 } from "../domain/types.js";
-import { isModeSCapable, RouteCache } from "../navdata/modes.js";
+import {
+  destinationParticipates,
+  isModeSCapable,
+  remainingRouteInside,
+  RouteCache,
+} from "../navdata/modes.js";
 import type { FeedResult } from "../vatsim/datafeed.js";
 
 export interface TickStats {
@@ -56,6 +61,12 @@ export class Engine {
    */
   private readonly observedAnywhere = new Map<string, Observation>();
   private readonly routeCache = new RouteCache();
+  /**
+   * Who was transmitting which exclusive code as of the last tick, kept so the
+   * snapshot can be rebuilt between ticks after a manual assignment.
+   */
+  private squawkedBy = new Map<Squawk, string[]>();
+  private modeSStates: ReadonlySet<string> = new Set();
   private serialised = "{}";
   private serialisedGzip = gzipSync("{}");
   private warmupRemaining: number;
@@ -74,6 +85,7 @@ export class Engine {
    */
   setConfig(snapshot: ConfigSnapshot): void {
     this.config = snapshot;
+    this.modeSStates = new Set(snapshot.raw.modeS.states);
     this.routeCache.clear();
   }
 
@@ -153,6 +165,7 @@ export class Engine {
       if (holders) holders.push(obs.callsign);
       else squawkedBy.set(obs.transponder, [obs.callsign]);
     }
+    this.squawkedBy = squawkedBy;
 
     // ---- Phase 2: reserve -------------------------------------------------
     pools.beginTick();
@@ -220,12 +233,7 @@ export class Engine {
     let conspicuity = 0;
 
     for (const obs of queue) {
-      const eligible =
-        isModeSCapable(obs.equipment) &&
-        this.routeCache.verdict(config.navdata, obs.departure, obs.arrival, obs.route)
-          .inside;
-
-      if (eligible) {
+      if (this.isModeSEligible(config, obs)) {
         this.put(obs, codeBook.conspicuity, "auto", null, now);
         conspicuity++;
         assigned++;
@@ -278,24 +286,12 @@ export class Engine {
     }
 
     // ---- Serialise --------------------------------------------------------
-    const snapshot: Snapshot = {};
-    let dupes = 0;
-    for (const assignment of this.assignments.values()) {
-      const holders = squawkedBy.get(assignment.code);
-      const dupe = holders !== undefined && holders.some((c) => c !== assignment.callsign);
-      if (dupe) dupes++;
-      snapshot[assignment.callsign] = { ssr: assignment.code, dupe };
-    }
-
     if (this.warmupRemaining > 0) {
       this.warmupRemaining--;
     } else {
       this.ready = true;
     }
-    if (this.ready) {
-      this.serialised = JSON.stringify(snapshot);
-      this.serialisedGzip = gzipSync(this.serialised);
-    }
+    const dupes = this.ready ? this.rebuildSnapshot() : 0;
 
     this.lastTick = {
       at: now,
@@ -343,10 +339,19 @@ export class Engine {
       this.put(obs, code, "manual", null, now);
     }
     if (config.codeBook.isExclusive(code)) config.pools.reserve(code, callsign);
+    // Publish immediately: the next poll must not serve the pre-change code.
+    if (this.ready) this.rebuildSnapshot();
     return { ssr: code, dupe: this.isDupe(callsign, code) };
   }
 
-  /** Issue a fresh code from the appropriate pool, discarding any manual flag. */
+  /**
+   * Re-run the server's own assignment decision, discarding any manual flag.
+   *
+   * This is the whole decision, Mode S included, not just a draw from the pool.
+   * Skipping the eligibility test would mean a flight already on 1000 could
+   * never be given 1000 again: pressing AUTO would drop it to a discrete code
+   * and there would be no way back to conspicuity.
+   */
   forceReassign(callsign: string): ManualResult | ManualRejection {
     const config = this.config;
     if (!config) return "unknown_callsign";
@@ -360,22 +365,111 @@ export class Engine {
       config.pools.release(existing.code);
     }
 
-    const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
-    if (!allocation) return "excluded_code";
-
-    if (existing) {
-      existing.code = allocation.code;
-      existing.provenance = "auto";
-      existing.issuedBy = allocation.range;
-      existing.assignedAt = now;
-      existing.lastSeen = now;
-    } else if (obs) {
-      this.put(obs, allocation.code, "auto", allocation.range, now);
+    if (obs && this.isModeSEligible(config, obs)) {
+      const code = config.codeBook.conspicuity;
+      this.reassign(obs, existing, code, null, "auto", now);
+      if (this.ready) this.rebuildSnapshot();
+      return { ssr: code, dupe: this.isDupe(callsign, code) };
     }
+
+    const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
+    if (!allocation) return "pool_exhausted";
+
+    this.reassign(obs, existing, allocation.code, allocation.range, "auto", now);
+    // Publish immediately: the next poll must not serve the pre-change code.
+    if (this.ready) this.rebuildSnapshot();
     return { ssr: allocation.code, dupe: this.isDupe(callsign, allocation.code) };
   }
 
+  /**
+   * Issue a discrete code, bypassing the Mode S decision entirely.
+   *
+   * The escape hatch from conspicuity: AUTO re-runs the server's judgement and
+   * will hand 1000 straight back to a flight that still qualifies, which is no
+   * use to a controller whose aircraft has a misbehaving transponder.
+   *
+   * Flagged `manual`, so the reconciliation loop cannot undo it. The controller
+   * has deliberately overridden the server, and that has to survive the flight
+   * being reassigned for any other reason.
+   */
+  forceDiscrete(callsign: string): ManualResult | ManualRejection {
+    const config = this.config;
+    if (!config) return "unknown_callsign";
+    const obs = this.observations.get(callsign);
+    const existing = this.assignments.get(callsign);
+    if (!obs && !existing) return "unknown_callsign";
+
+    const now = Date.now();
+
+    if (existing && config.codeBook.isExclusive(existing.code)) {
+      config.pools.release(existing.code);
+    }
+
+    const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
+    if (!allocation) return "pool_exhausted";
+
+    this.reassign(obs, existing, allocation.code, allocation.range, "manual", now);
+    if (this.ready) this.rebuildSnapshot();
+    return { ssr: allocation.code, dupe: this.isDupe(callsign, allocation.code) };
+  }
+
+  /** Point an assignment at a new code, creating the entry if it is new. */
+  private reassign(
+    obs: Observation | undefined,
+    existing: Assignment | undefined,
+    code: Squawk,
+    issuedBy: string | null,
+    provenance: Assignment["provenance"],
+    now: number,
+  ): void {
+    if (existing) {
+      existing.code = code;
+      existing.provenance = provenance;
+      existing.issuedBy = issuedBy;
+      existing.assignedAt = now;
+      existing.lastSeen = now;
+    } else if (obs) {
+      this.put(obs, code, provenance, issuedBy, now);
+    }
+  }
+
   // ------------------------------------------------------------- internals
+
+  /**
+   * Rebuild the served snapshot from the current map. Returns the DUPE count.
+   *
+   * Called at the end of every tick AND after every manual assignment. The
+   * second is not an optimisation: the map changes the moment a controller
+   * acts, but the tick only runs every 15 s, so without this the plugin would
+   * fetch a snapshot still holding the old code and push the aircraft straight
+   * back to it -- the code visibly changing and then reverting.
+   */
+  private rebuildSnapshot(): number {
+    const snapshot: Snapshot = {};
+    let dupes = 0;
+    for (const assignment of this.assignments.values()) {
+      const holders = this.squawkedBy.get(assignment.code);
+      const dupe = holders !== undefined && holders.some((c) => c !== assignment.callsign);
+      if (dupe) dupes++;
+      snapshot[assignment.callsign] = { ssr: assignment.code, dupe };
+    }
+    this.serialised = JSON.stringify(snapshot);
+    this.serialisedGzip = gzipSync(this.serialised);
+    return dupes;
+  }
+
+  /**
+   * Mode S 1000 eligibility: capable equipment, a destination in a
+   * participating state, and a REMAINING route that stays inside the area.
+   */
+  private isModeSEligible(config: ConfigSnapshot, obs: Observation): boolean {
+    if (!isModeSCapable(obs.equipment)) return false;
+    if (!destinationParticipates(obs.arrival, this.modeSStates)) return false;
+    const points = this.routeCache.expand(
+      config.navdata, obs.departure, obs.arrival, obs.route,
+    );
+    return remainingRouteInside(config.navdata, points, obs.latitude, obs.longitude).inside;
+  }
 
   private isDupe(callsign: string, code: Squawk): boolean {
     const config = this.config;

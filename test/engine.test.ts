@@ -256,3 +256,60 @@ describe("the pool never issues a reserved code", () => {
     assert.ok(issued.length > 0, "the surrounding codes are still usable");
   });
 });
+
+describe("AUTO re-runs the whole decision, Mode S included", () => {
+  const modeS = { equipment: "B738/M-SDE1E2E3FGHIRWY/LB1", route: "INSID", arrival: "LFBO" };
+
+  it("returns 1000 again for a flight that still qualifies", () => {
+    const engine = engineWith(TINY_POOL);
+    engine.tick(feed([pilot("MS1", "2000", modeS)]));
+    assert.equal(engine.all()[0]?.code, "1000", "the loop put it on conspicuity");
+
+    // Without the eligibility test in forceReassign this drops to a discrete
+    // code and can never come back.
+    const result = engine.forceReassign("MS1");
+    assert.deepEqual(result, { ssr: "1000", dupe: false });
+  });
+
+  it("still issues a discrete code when the flight does not qualify", () => {
+    const engine = engineWith(TINY_POOL);
+    // Route leaves the area, so no conspicuity.
+    engine.tick(feed([pilot("OUT", "2000", { ...modeS, route: "ELSEWHERE" })]));
+    const result = engine.forceReassign("OUT");
+    assert.ok(typeof result !== "string", `expected a code, got ${String(result)}`);
+    assert.notEqual(result.ssr, "1000", "an ineligible flight must not get conspicuity");
+    assert.ok(result.ssr.startsWith("03"), `expected a pool code, got ${result.ssr}`);
+  });
+});
+
+describe("force discrete bypasses Mode S", () => {
+  const modeS = { equipment: "B738/M-SDE1E2E3FGHIRWY/LB1", route: "INSID", arrival: "LFBO" };
+
+  it("takes an eligible flight off 1000 and gives it a pool code", () => {
+    const engine = engineWith(TINY_POOL);
+    engine.tick(feed([pilot("MS1", "2000", modeS)]));
+    assert.equal(engine.all()[0]?.code, "1000");
+
+    const result = engine.forceDiscrete("MS1");
+    assert.ok(typeof result !== "string", `expected a code, got ${String(result)}`);
+    assert.notEqual(result.ssr, "1000", "the whole point is to leave conspicuity");
+    assert.ok(result.ssr.startsWith("03"), `expected a pool code, got ${result.ssr}`);
+  });
+
+  it("flags it manual so the loop cannot put it back on 1000", () => {
+    const engine = engineWith(TINY_POOL);
+    engine.tick(feed([pilot("MS1", "2000", modeS)]));
+    engine.forceDiscrete("MS1");
+    const forced = engine.all()[0]?.code;
+
+    engine.tick(feed([pilot("MS1", "2000", modeS)]));
+    assert.equal(engine.all()[0]?.code, forced, "a deliberate override must survive the tick");
+    assert.equal(engine.all()[0]?.provenance, "manual");
+  });
+
+  it("reports pool exhaustion rather than a misleading rejection", () => {
+    const engine = engineWith(SINGLE_CODE);
+    engine.tick(feed([pilot("SQUATTER", "0301"), pilot("MS1", "2000", modeS)]));
+    assert.equal(engine.forceDiscrete("MS1"), "pool_exhausted");
+  });
+});

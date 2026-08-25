@@ -82,4 +82,6 @@ export type ManualRejection =
   | "unknown_callsign"
   | "excluded_code"
   | "malformed_code"
-  | "not_authorised";
+  | "not_authorised"
+  /** No range serving this flight's destination has a free code. */
+  | "pool_exhausted";

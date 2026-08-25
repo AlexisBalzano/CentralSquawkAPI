@@ -53,11 +53,24 @@ export interface CodeRange {
   destinations: string[];
 }
 
+export interface ModeSConfig {
+  /**
+   * ICAO region prefixes of the Mode S participating states.
+   *
+   * Used to decide whether a flight's DESTINATION is in the area. The route
+   * itself is tested against fix.txt, but fix.txt holds no aerodromes, so the
+   * last leg of the remaining route needs this instead. Should match the
+   * PARTICIPATING list that built modes_area.geojson.
+   */
+  states: string[];
+}
+
 export interface RawConfig {
   version: number;
   aor: AorConfig;
   codes: CodesConfig;
   timing: TimingConfig;
+  modeS: ModeSConfig;
   /** Codes inside the CAL ranges that must never be issued. */
   exclusions: string[];
 }
@@ -174,10 +187,23 @@ export function parseConfig(input: unknown): RawConfig {
     tickIntervalSec: c.number(timingRaw["tickIntervalSec"], "config.timing.tickIntervalSec", 1, 3600),
   };
 
+  const modeSRaw = c.object(root["modeS"], "config.modeS");
+  const states = c.stringList(modeSRaw["states"], "config.modeS.states").map((s) => s.toUpperCase());
+  for (const s of states) {
+    if (!/^[A-Z]{2}$/.test(s)) {
+      c.fail(`config.modeS.states: ${JSON.stringify(s)} is not a two-letter ICAO region prefix`);
+    }
+  }
+  if (states.length === 0) {
+    // With no states nothing is ever destined to the area, so nothing would
+    // ever qualify for 1000 and the whole Mode S rule would silently be off.
+    c.fail("config.modeS.states: at least one participating state is required");
+  }
+
   const exclusions = c.squawkList(root["exclusions"] ?? [], "config.exclusions");
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
-  return { version, aor, codes, timing, exclusions };
+  return { version, aor, codes, timing, modeS: { states }, exclusions };
 }
 
 /** Validate ssr_pool.json, the generated CAL allocation table. */
