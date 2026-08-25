@@ -1,0 +1,24 @@
+# Local development overlay.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+#
+# Serves the CentralSquawk-config checkout sitting beside this repository
+# instead of cloning from GitHub, so edits to config.json or a freshly
+# regenerated fix.txt are picked up by restarting the container rather than by
+# committing and pushing first.
+#
+# The mount is READ-ONLY deliberately. init-config.sh's fetch path runs
+# `git reset --hard`, which against a bind-mounted working tree would discard
+# uncommitted work on the host. CONFIG_SKIP_FETCH=1 disables that path, and the
+# read-only flag means a future change cannot quietly re-enable it.
+
+services:
+  api:
+    environment:
+      - NODE_ENV=development
+      - LOG_LEVEL=debug
+      - CONFIG_SKIP_FETCH=1
+      # Warm up in a single tick; nobody wants 30 s of 503 while testing.
+      - WARMUP_CYCLES=0
+    volumes:
+      - ../CentralSquawk-config:/app/data:ro

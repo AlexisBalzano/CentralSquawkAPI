@@ -1,0 +1,53 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: centralsquawk-redis
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+    container_name: centralsquawk-api
+    ports:
+      - "3000:3000"
+    env_file:
+      # Optional: local development runs fine without one, since an empty
+      # AUTH_SECRET simply disables token verification.
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - REDIS_URL=redis://redis:6379
+      - CONFIG_DIR=/app/data
+      - CONFIG_REPO_URL=https://github.com/AlexisBalzano/CentralSquawk-config.git
+      - CONFIG_BRANCH=main
+    volumes:
+      - config-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # /health returns 503 until config is loaded and the datafeed is fresh, so
+      # this doubles as a readiness gate. start_period covers the warm-up ticks,
+      # during which the service is up but deliberately answering 503.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  redis-data:
+    driver: local
+  config-data:
+    driver: local
