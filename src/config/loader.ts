@@ -14,10 +14,12 @@ import { Area, ringsFromGeoJson } from "../geo.js";
 import { CodeBook } from "../domain/codes.js";
 import { PoolRegistry } from "../domain/pools.js";
 import { loadNavdata, type Navdata } from "../navdata/navdata.js";
-import { ConfigError, parseConfig, type RawConfig } from "./schema.js";
+import { ConfigError, parseConfig, parsePool, type CodeRange, type RawConfig } from "./schema.js";
 
 export interface ConfigSnapshot {
   raw: RawConfig;
+  /** The CAL allocation table, as loaded from ssr_pool.json. */
+  ranges: CodeRange[];
   codeBook: CodeBook;
   pools: PoolRegistry;
   /** The Mode S conspicuity area. Kept for provenance and health reporting. */
@@ -70,14 +72,28 @@ export async function loadConfigSnapshot(dir: string): Promise<ConfigSnapshot> {
   }
 
   const navdata = await loadNavdata(dir);
-  const pools = new PoolRegistry(raw.pools);
+
+  const poolText = await readFile(path.join(dir, "ssr_pool.json"), "utf8");
+  let ranges: CodeRange[];
+  try {
+    ranges = parsePool(JSON.parse(poolText) as unknown);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new ConfigError([`ssr_pool.json is not valid JSON: ${err.message}`]);
+    }
+    throw err;
+  }
+
+  const codeBook = new CodeBook(raw.codes, raw.exclusions);
+  const pools = new PoolRegistry(ranges, codeBook.nonIssuable());
   if (pools.capacity === 0) {
-    throw new ConfigError(["config.pools published no usable codes"]);
+    throw new ConfigError(["ssr_pool.json published no issuable codes"]);
   }
 
   return {
     raw,
-    codeBook: new CodeBook(raw.codes, raw.pools),
+    ranges,
+    codeBook,
     pools,
     modesArea,
     aor,

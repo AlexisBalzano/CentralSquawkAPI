@@ -37,7 +37,8 @@ export interface TickStats {
   reassigned: number;
   released: number;
   dupes: number;
-  borrowed: number;
+  /** Assignments drawn from an any-destination range rather than a specific one. */
+  wildcard: number;
   exhausted: number;
   conspicuity: number;
   durationMs: number;
@@ -214,7 +215,7 @@ export class Engine {
 
     // ---- Phase 4: allocate ------------------------------------------------
     let assigned = 0;
-    let borrowed = 0;
+    let wildcard = 0;
     let exhausted = 0;
     let conspicuity = 0;
 
@@ -231,14 +232,16 @@ export class Engine {
         continue;
       }
 
-      const fir = this.resolveFir(config, obs.latitude, obs.longitude);
-      const allocation = pools.allocate(fir, obs.callsign);
+      // ORCAM allocates by destination, so where the flight is going decides
+      // which ranges may serve it. A flight with no filed destination can only
+      // be served from an any-destination range.
+      const allocation = pools.allocate(obs.arrival, obs.callsign);
       if (!allocation) {
         exhausted++;
         continue;
       }
-      if (allocation.borrowed) borrowed++;
-      this.put(obs, allocation.code, "auto", allocation.issuedBy, now);
+      if (allocation.wildcard) wildcard++;
+      this.put(obs, allocation.code, "auto", allocation.range, now);
       assigned++;
     }
 
@@ -303,7 +306,7 @@ export class Engine {
       reassigned: mustReassign.length,
       released,
       dupes,
-      borrowed,
+      wildcard,
       exhausted,
       conspicuity,
       durationMs: Date.now() - started,
@@ -351,26 +354,23 @@ export class Engine {
     const existing = this.assignments.get(callsign);
     if (!obs && !existing) return "unknown_callsign";
 
-    const lat = obs?.latitude ?? 0;
-    const lon = obs?.longitude ?? 0;
     const now = Date.now();
 
     if (existing && config.codeBook.isExclusive(existing.code)) {
       config.pools.release(existing.code);
     }
 
-    const fir = this.resolveFir(config, lat, lon);
-    const allocation = config.pools.allocate(fir, callsign);
+    const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
     if (!allocation) return "excluded_code";
 
     if (existing) {
       existing.code = allocation.code;
       existing.provenance = "auto";
-      existing.issuedBy = allocation.issuedBy;
+      existing.issuedBy = allocation.range;
       existing.assignedAt = now;
       existing.lastSeen = now;
     } else if (obs) {
-      this.put(obs, allocation.code, "auto", allocation.issuedBy, now);
+      this.put(obs, allocation.code, "auto", allocation.range, now);
     }
     return { ssr: allocation.code, dupe: this.isDupe(callsign, allocation.code) };
   }
@@ -420,22 +420,4 @@ export class Engine {
     pools.release(assignment.code);
   }
 
-  /**
-   * Which FIR's pool should issue for a position: the one containing it, or
-   * failing that the nearest, which is what attributes traffic sitting inside
-   * the entry ring but not yet inside any FIR.
-   */
-  private resolveFir(config: ConfigSnapshot, lat: number, lon: number): string {
-    let nearest = config.raw.aor.firs[0] ?? "";
-    let best = Infinity;
-    for (const [fir, area] of config.firAreas) {
-      if (area.contains(lat, lon)) return fir;
-      const d = area.distanceToEdgeNm(lat, lon);
-      if (d < best) {
-        best = d;
-        nearest = fir;
-      }
-    }
-    return nearest;
-  }
 }

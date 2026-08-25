@@ -52,7 +52,8 @@ async function main(): Promise<void> {
   await app.listen({ port: env.port, host: env.host });
   app.log.info(
     `navdata AIRAC ${initial.navdata.cycle}, ${initial.navdata.fixes.size} fixes, ` +
-      `${initial.pools.capacity} codes across ${Object.keys(initial.raw.pools).length} pools`,
+      `${initial.pools.capacity} issuable codes across ${initial.ranges.length} CAL ranges ` +
+      `(${initial.pools.utilisation().anyDestination.capacity} any-destination)`,
   );
 
   const tickMs = initial.raw.timing.tickIntervalSec * 1000;

@@ -166,9 +166,37 @@ those codes are never reserved against a pool and never raise a DUPE.
 | Emergency (`7500` `7600` `7700`) | no | no | no |
 | Excluded (per-FIR list) | no | no | yes |
 
-Pools are per FIR, allocation is round-robin so a released code is not
-immediately reissued, and exhaustion borrows from another FIR's spare capacity
-while recording the origin.
+### One national pool, allocated by destination
+
+The pool comes from `ssr_pool.json`, generated from the EUROCONTROL Code
+Allocation List. Two things about the CAL shape the allocator:
+
+**It allocates to LF nationally, not per FIR.** Only four ranges name a specific
+French unit (all LFMM). There is therefore one pool rather than five, and no
+entry-FIR ownership: splitting the national allocation across the FIRs would
+have been our invention rather than something EUROCONTROL published.
+
+**It allocates by destination.** `0401-0477` may only be issued to flights
+landing in France, `7440-7477` only to flights bound for the UK, Ireland or
+North America, and only some ranges carry `ALL`. Destinations are ICAO prefixes
+of one, two or four characters, matched against the arrival aerodrome.
+
+Allocation therefore takes the flight's destination and prefers **the most
+specific matching range**, so any-destination ranges are held back for traffic
+that has no specific allocation. Of 1,812 issuable codes only 402 are
+any-destination, so spending them on flights that had a specific range available
+would strand everyone else. A flight with no filed destination can only draw
+from an any-destination range.
+
+Allocation is round-robin within a range so a released code is not immediately
+reissued. Exhaustion is reported per destination rather than outright: running
+out means no range serving *that* destination has a free code.
+
+The CAL is an allocation table, not a policy statement — a range can span a
+conspicuity or emergency code, and nothing in the file prevents it. The loader
+folds the default, conspicuity and emergency codes into the pool's exclusions,
+so `1000`, `7000` and `7700` can never be handed out as discrete codes even
+where a range covers them.
 
 Reservations are rebuilt from scratch every tick. That is what makes
 reserve-before-allocate enforceable rather than merely intended.
@@ -252,9 +280,13 @@ Break any of these and the service will still appear to work.
 
 ## Known gaps
 
-- **The pools in `config.json` are placeholders.** They are synthetic ranges
-  that exist so the service runs. Real French ORCAM allocations and their
-  exclusion lists must replace them before production.
+- **Two CAL ranges are dead capacity.** `3510-3537` and `7470-7477` are destined
+  to FIR identifiers (`LFMM`, `EDGG`) rather than aerodrome prefixes, so nothing
+  matches them without aerodrome-to-FIR resolution. `7470-7477` also overlaps
+  `7440-7477` and loses its codes to it.
+- **Roughly half the French allocation is unusable by design.** 1,825 codes are
+  shared across the EUR-B participating area and cannot be issued unilaterally.
+  Using them would need real-time coordination with the other states.
 - **Auth is the accepted-weak scheme.** `SHA256(secret + callsign)` with the
   secret compiled into a distributed DLL. Recorded as an accepted risk.
 - **Identifier collisions.** Around 915 identifiers are reused among in-area

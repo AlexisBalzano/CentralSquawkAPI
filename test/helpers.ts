@@ -6,7 +6,7 @@ import { PoolRegistry } from "../src/domain/pools.js";
 import type { Observation } from "../src/domain/types.js";
 import { Area } from "../src/geo.js";
 import type { Navdata } from "../src/navdata/navdata.js";
-import type { RawConfig, PoolsConfig } from "../src/config/schema.js";
+import type { CodeRange, RawConfig } from "../src/config/schema.js";
 import type { FeedResult } from "../src/vatsim/datafeed.js";
 
 /** A square covering roughly northern France, in GeoJSON [lon, lat] order. */
@@ -22,9 +22,14 @@ export const INSIDE = { latitude: 48, longitude: 2.5 };
 /** Comfortably beyond the padded zone used below. */
 export const FAR_AWAY = { latitude: 20, longitude: -40 };
 
-export function makeConfig(pools: PoolsConfig): ConfigSnapshot {
+/** Shorthand for a CAL range: `range("0301", "0304")` is any-destination. */
+export function range(from: string, to: string, destinations = ["*"]): CodeRange {
+  return { from, to, destinations };
+}
+
+export function makeConfig(ranges: CodeRange[], exclusions: string[] = []): ConfigSnapshot {
   const raw: RawConfig = {
-    version: 1,
+    version: 2,
     aor: { firs: ["LFFF"], entryRingNm: 40, zonePaddingNm: 100 },
     codes: {
       default: ["0000", "1200", "1234", "2000", "7000"],
@@ -33,7 +38,7 @@ export function makeConfig(pools: PoolsConfig): ConfigSnapshot {
       manuallyAssignable: ["7600", "7700"],
     },
     timing: { gracePeriodSec: 300, groundSpeedThresholdKt: 50, tickIntervalSec: 15 },
-    pools,
+    exclusions,
   };
 
   const area = new Area([SQUARE]);
@@ -44,10 +49,12 @@ export function makeConfig(pools: PoolsConfig): ConfigSnapshot {
     procedures: new Map(),
   };
 
+  const codeBook = new CodeBook(raw.codes, raw.exclusions);
   return {
     raw,
-    codeBook: new CodeBook(raw.codes, pools),
-    pools: new PoolRegistry(pools),
+    ranges,
+    codeBook,
+    pools: new PoolRegistry(ranges, codeBook.nonIssuable()),
     modesArea: area,
     aor: area,
     firAreas: new Map([["LFFF", area]]),

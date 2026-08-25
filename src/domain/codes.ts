@@ -8,7 +8,7 @@
  */
 
 import type { CodeClass, Squawk } from "./types.js";
-import type { CodesConfig, PoolsConfig } from "../config/schema.js";
+import type { CodesConfig } from "../config/schema.js";
 
 const SQUAWK_PATTERN = /^[0-7]{4}$/;
 
@@ -23,14 +23,29 @@ export class CodeBook {
   private readonly excluded: ReadonlySet<Squawk>;
   readonly conspicuity: Squawk;
 
-  constructor(codes: CodesConfig, pools: PoolsConfig) {
+  constructor(codes: CodesConfig, exclusions: readonly Squawk[]) {
     this.defaults = new Set(codes.default);
     this.emergency = new Set(codes.emergency);
     this.manuallyAssignable = new Set(codes.manuallyAssignable);
     this.conspicuity = codes.conspicuity;
-    this.excluded = new Set(
-      Object.values(pools).flatMap((pool) => pool.exclusions),
-    );
+    this.excluded = new Set(exclusions);
+  }
+
+  /**
+   * Every code the pool must never issue, even where a CAL range covers it.
+   *
+   * The CAL is an allocation table, not a policy statement: a range can span a
+   * conspicuity or emergency code, and nothing in the file stops it. Folding
+   * these into the pool's exclusions is what guarantees 1000, 7000 or 7700 can
+   * never be handed out as if it were a discrete code.
+   */
+  nonIssuable(): Set<Squawk> {
+    return new Set<Squawk>([
+      ...this.defaults,
+      ...this.emergency,
+      ...this.excluded,
+      this.conspicuity,
+    ]);
   }
 
   classify(code: string): CodeClass {

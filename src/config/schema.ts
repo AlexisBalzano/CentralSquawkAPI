@@ -1,6 +1,9 @@
 /**
- * Shape of config.json in the CentralSquawk-config repository, and its
- * validator.
+ * Shape of the ingested configuration, and its validators.
+ *
+ * Two files feed this: config.json, which is hand-maintained policy, and
+ * ssr_pool.json, which is generated from the EUROCONTROL CAL and should never
+ * be edited by hand.
  *
  * Validation is deliberately strict and total: a config snapshot is either
  * fully valid and gets swapped in, or it is rejected in one piece and the
@@ -36,21 +39,27 @@ export interface TimingConfig {
   tickIntervalSec: number;
 }
 
-export interface PoolConfig {
-  /** Inclusive [first, last] octal code ranges. */
-  ranges: [string, string][];
-  /** Codes inside those ranges that must never be issued. */
-  exclusions: string[];
+/**
+ * One CAL allocation: an inclusive octal range plus the destinations it may be
+ * issued for.
+ *
+ * ORCAM allocates by destination, so a range is not usable for every flight.
+ * Destinations are ICAO prefixes of one, two or four characters matched against
+ * the arrival aerodrome; `["*"]` means any destination.
+ */
+export interface CodeRange {
+  from: string;
+  to: string;
+  destinations: string[];
 }
-
-export type PoolsConfig = Record<string, PoolConfig>;
 
 export interface RawConfig {
   version: number;
   aor: AorConfig;
   codes: CodesConfig;
   timing: TimingConfig;
-  pools: PoolsConfig;
+  /** Codes inside the CAL ranges that must never be issued. */
+  exclusions: string[];
 }
 
 export class ConfigError extends Error {
@@ -61,6 +70,8 @@ export class ConfigError extends Error {
 }
 
 const SQUAWK = /^[0-7]{4}$/;
+/** ICAO prefix: one, two or four characters, or the any-destination wildcard. */
+const DESTINATION = /^(\*|[A-Z]{1,2}|[A-Z]{4})$/;
 
 class Check {
   readonly problems: string[] = [];
@@ -163,39 +174,51 @@ export function parseConfig(input: unknown): RawConfig {
     tickIntervalSec: c.number(timingRaw["tickIntervalSec"], "config.timing.tickIntervalSec", 1, 3600),
   };
 
-  const poolsRaw = c.object(root["pools"], "config.pools");
-  const pools: PoolsConfig = {};
-  for (const [fir, value] of Object.entries(poolsRaw)) {
-    const at = `config.pools.${fir}`;
-    const poolRaw = c.object(value, at);
-    const ranges: [string, string][] = [];
-    if (!Array.isArray(poolRaw["ranges"])) {
-      c.fail(`${at}.ranges: expected an array of [first, last] pairs`);
-    } else {
-      poolRaw["ranges"].forEach((pair, i) => {
-        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string") {
-          c.fail(`${at}.ranges[${i}]: expected a [first, last] pair of code strings`);
-          return;
-        }
-        const [first, last] = pair as [string, string];
-        if (!SQUAWK.test(first) || !SQUAWK.test(last)) {
-          c.fail(`${at}.ranges[${i}]: ${first}-${last} are not four-digit octal codes`);
-          return;
-        }
-        if (parseInt(first, 8) > parseInt(last, 8)) {
-          c.fail(`${at}.ranges[${i}]: ${first} is above ${last}`);
-          return;
-        }
-        ranges.push([first, last]);
-      });
-    }
-    if (ranges.length === 0) c.fail(`${at}.ranges: at least one usable range is required`);
-    pools[fir] = { ranges, exclusions: c.squawkList(poolRaw["exclusions"] ?? [], `${at}.exclusions`) };
-  }
-  for (const fir of aor.firs) {
-    if (!(fir in pools)) c.fail(`config.pools: no pool for ${fir}, which config.aor.firs lists`);
-  }
+  const exclusions = c.squawkList(root["exclusions"] ?? [], "config.exclusions");
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
-  return { version, aor, codes, timing, pools };
+  return { version, aor, codes, timing, exclusions };
+}
+
+/** Validate ssr_pool.json, the generated CAL allocation table. */
+export function parsePool(input: unknown): CodeRange[] {
+  const c = new Check();
+  const root = c.object(input, "ssr_pool");
+
+  const raw = root["ranges"];
+  const ranges: CodeRange[] = [];
+  if (!Array.isArray(raw)) {
+    c.fail("ssr_pool.ranges: expected an array");
+  } else {
+    raw.forEach((entry, i) => {
+      const at = `ssr_pool.ranges[${i}]`;
+      const r = c.object(entry, at);
+      const from = typeof r["from"] === "string" ? r["from"] : "";
+      const to = typeof r["to"] === "string" ? r["to"] : "";
+      if (!SQUAWK.test(from) || !SQUAWK.test(to)) {
+        c.fail(`${at}: from/to must be four-digit octal codes, got ${from}-${to}`);
+        return;
+      }
+      if (parseInt(from, 8) > parseInt(to, 8)) {
+        c.fail(`${at}: ${from} is above ${to}`);
+        return;
+      }
+      const destinations = c.stringList(r["destinations"], `${at}.destinations`)
+        .map((d) => d.toUpperCase());
+      if (destinations.length === 0) {
+        c.fail(`${at}.destinations: at least one destination is required ("*" for any)`);
+        return;
+      }
+      for (const d of destinations) {
+        if (!DESTINATION.test(d)) {
+          c.fail(`${at}.destinations: ${JSON.stringify(d)} is not an ICAO prefix or "*"`);
+        }
+      }
+      ranges.push({ from, to, destinations });
+    });
+  }
+
+  if (ranges.length === 0) c.fail("ssr_pool.ranges: no usable ranges");
+  if (c.problems.length > 0) throw new ConfigError(c.problems);
+  return ranges;
 }

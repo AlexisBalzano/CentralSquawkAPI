@@ -9,16 +9,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { Engine } from "../src/engine/engine.js";
-import { feed, makeConfig, pilot, FAR_AWAY } from "./helpers.js";
+import { feed, makeConfig, pilot, range, FAR_AWAY } from "./helpers.js";
 
-/** A pool holding exactly the codes 0301..0304. */
-const TINY_POOL = { LFFF: { ranges: [["0301", "0304"]] as [string, string][], exclusions: [] } };
+/** A pool holding exactly the codes 0301..0304, issuable anywhere. */
+const TINY_POOL = [range("0301", "0304")];
 /** A pool holding exactly one code. */
-const SINGLE_CODE = { LFFF: { ranges: [["0301", "0301"]] as [string, string][], exclusions: [] } };
+const SINGLE_CODE = [range("0301", "0301")];
 
-function engineWith(pools: Parameters<typeof makeConfig>[0]): Engine {
+function engineWith(ranges: Parameters<typeof makeConfig>[0]): Engine {
   const engine = new Engine(0); // no warm-up: ready after the first tick
-  engine.setConfig(makeConfig(pools));
+  engine.setConfig(makeConfig(ranges));
   return engine;
 }
 
@@ -60,8 +60,7 @@ describe("reserve before allocate", () => {
   it("issues no duplicate codes on a cold start with heavy traffic", () => {
     // The realistic shape of the bug: an empty map, many aircraft already
     // squawking pool codes, and many more needing one, all in a single pass.
-    const pools = { LFFF: { ranges: [["0301", "0377"]] as [string, string][], exclusions: [] } };
-    const engine = engineWith(pools);
+    const engine = engineWith([range("0301", "0377")]);
 
     const observations = [
       ...Array.from({ length: 20 }, (_, i) =>
@@ -185,5 +184,75 @@ describe("scope rules", () => {
     engine.tick(feed([pilot("VFR1", "7000", { flightRules: "V" })]));
     const result = engine.forceReassign("VFR1");
     assert.ok(typeof result !== "string", `expected a code, got ${String(result)}`);
+  });
+});
+
+describe("destination-aware allocation", () => {
+  it("does not issue a range whose destination does not match the flight", () => {
+    // The only codes available are reserved for flights bound to the UK, and
+    // this one is going to Toulouse.
+    const engine = engineWith([range("0301", "0304", ["EG"])]);
+    const stats = engine.tick(feed([pilot("NEEDY", "2000", { arrival: "LFBO" })]));
+
+    assert.equal(engine.all().length, 0, "no code may be issued for the wrong destination");
+    assert.equal(stats.exhausted, 1, "reported as exhausted for that destination");
+  });
+
+  it("issues a destination-restricted range to a matching flight", () => {
+    const engine = engineWith([range("0301", "0304", ["LF"])]);
+    engine.tick(feed([pilot("NEEDY", "2000", { arrival: "LFBO" })]));
+    assert.equal(engine.all()[0]?.code, "0301");
+  });
+
+  it("prefers the specific range so any-destination capacity is conserved", () => {
+    // Both ranges could serve an LF-bound flight. Spending the wildcard range
+    // on it would strand traffic that has no specific allocation at all.
+    const engine = engineWith([
+      range("0501", "0504", ["*"]),
+      range("0301", "0304", ["LF"]),
+    ]);
+    engine.tick(feed([pilot("TOULOUSE", "2000", { arrival: "LFBO" })]));
+
+    const code = engine.all()[0]?.code ?? "";
+    assert.ok(code.startsWith("03"), `expected the LF range, got ${code}`);
+  });
+
+  it("falls back to any-destination when nothing specific matches", () => {
+    const engine = engineWith([
+      range("0501", "0504", ["*"]),
+      range("0301", "0304", ["LF"]),
+    ]);
+    engine.tick(feed([pilot("BERLIN", "2000", { arrival: "EDDB" })]));
+
+    const code = engine.all()[0]?.code ?? "";
+    assert.ok(code.startsWith("05"), `expected the wildcard range, got ${code}`);
+  });
+
+  it("serves a flight with no filed destination only from any-destination ranges", () => {
+    const engine = engineWith([range("0301", "0304", ["LF"])]);
+    engine.tick(feed([pilot("NOPLAN", "2000", { arrival: null })]));
+    assert.equal(engine.all().length, 0, "an unknown destination matches no specific range");
+  });
+
+  it("matches on ICAO prefix, so a one-letter token covers a whole region", () => {
+    const engine = engineWith([range("0301", "0304", ["K"])]);
+    engine.tick(feed([pilot("NEWYORK", "2000", { arrival: "KJFK" })]));
+    assert.equal(engine.all()[0]?.code, "0301", "K should match KJFK");
+  });
+});
+
+describe("the pool never issues a reserved code", () => {
+  it("skips conspicuity, default and emergency codes a CAL range covers", () => {
+    // A real CAL range can span codes that must never be handed out. 7677-7702
+    // contains 7700, and 0777-1002 contains 1000.
+    const engine = engineWith([range("7677", "7702"), range("0777", "1002")]);
+
+    const flights = Array.from({ length: 6 }, (_, i) => pilot(`F${i}`, "2000"));
+    engine.tick(feed(flights));
+
+    const issued = engine.all().map((a) => a.code);
+    assert.ok(!issued.includes("7700"), `7700 was issued: ${issued.join(", ")}`);
+    assert.ok(!issued.includes("1000"), `1000 was issued: ${issued.join(", ")}`);
+    assert.ok(issued.length > 0, "the surrounding codes are still usable");
   });
 });
