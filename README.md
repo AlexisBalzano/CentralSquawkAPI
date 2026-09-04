@@ -59,6 +59,7 @@ completes, which takes `WARMUP_CYCLES` datafeed cycles (about 30 s by default).
 | Route | Purpose |
 | --- | --- |
 | `GET /health` | Status, navdata cycle, pool utilisation, last tick |
+| `GET /logs` | Plain-text decision log, including why 1000 was refused |
 | `GET /api/squawks` | The snapshot, gzipped |
 | `POST /api/assign` | Manual set-code or force-reassign |
 | `POST /api/config-webhook` | HMAC-verified config reload |

@@ -236,6 +236,7 @@ bind-mounted working tree would discard uncommitted work.
 | Route | Purpose |
 | --- | --- |
 | `GET /health` | Status, navdata cycle, pool utilisation, last tick stats |
+| `GET /logs` | Plain-text decision log. `?q=` filters, `?lines=` limits |
 | `GET /api/squawks` | The snapshot. gzip. `503` until the first sweep completes |
 | `POST /api/assign` | Manual set-code or force-reassign, answered synchronously |
 | `POST /api/config-webhook` | HMAC-verified config reload |
@@ -248,6 +249,15 @@ result. Serving either encoding is a buffer write; the route picks one from
 `Accept-Encoding` and sets `Vary`.
 
 Measured on live traffic: 2874 bytes raw, 700 gzipped, 4.1x.
+
+`/logs` serves an in-memory ring buffer, separate from pino. pino goes to the
+container's stdout, where an operator looks; `/logs` is for the controller who
+wants to know why the flight in front of them got 7201 rather than 1000 and has
+no shell on the box. Every discrete assignment therefore carries the reason
+conspicuity was refused -- the one piece of information that exists nowhere else
+once a code has been drawn from the pool. The buffer holds the last 4000 lines,
+sized so a cold start (one line per flight already in scope) still leaves hours
+of ordinary traffic behind it.
 
 `/health` reports `degraded` when Redis is down or the engine is still warming,
 and `unhealthy` (`503`) when config is missing or the datafeed has gone stale.

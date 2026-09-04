@@ -3,6 +3,7 @@
 import { loadConfigSnapshot, type ConfigSnapshot } from "./config/loader.js";
 import { Engine } from "./engine/engine.js";
 import { env } from "./env.js";
+import { logbook } from "./logbook.js";
 import { buildServer, type Services } from "./server.js";
 import { PersistenceStore } from "./store/redis.js";
 import { fetchDatafeed } from "./vatsim/datafeed.js";
@@ -56,12 +57,21 @@ async function main(): Promise<void> {
       `(${initial.pools.utilisation().anyDestination.capacity} any-destination)`,
   );
 
+  logbook.record(
+    "status",
+    `listening on ${env.host}:${env.port} -- navdata AIRAC ${initial.navdata.cycle}, ` +
+      `${initial.pools.capacity} issuable codes across ${initial.ranges.length} CAL ranges, ` +
+      `${engine.size} assignments restored`,
+  );
+
   const tickMs = initial.raw.timing.tickIntervalSec * 1000;
 
   const poll = async (): Promise<void> => {
     try {
+      const wasStale = lastFeedOk > 0 && Date.now() - lastFeedOk >= FEED_STALE_MS;
       const feed = await fetchDatafeed(env.vatsimDatafeedUrl);
       lastFeedOk = Date.now();
+      if (wasStale) logbook.record("status", "datafeed recovered");
       const stats = engine.tick(feed);
       app.log.info(
         {
@@ -80,6 +90,7 @@ async function main(): Promise<void> {
       await store.save(engine.all());
     } catch (err) {
       app.log.error({ err }, "tick failed");
+      logbook.record("status", `tick FAILED: ${(err as Error).message}`);
     }
   };
 
@@ -88,6 +99,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info(`${signal} received, shutting down`);
+    logbook.record("status", `${signal} received, shutting down`);
     clearInterval(timer);
     await store.save(engine.all());
     await store.disconnect();

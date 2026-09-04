@@ -32,6 +32,14 @@ import {
   RouteCache,
 } from "../navdata/modes.js";
 import type { FeedResult } from "../vatsim/datafeed.js";
+import { by, logbook } from "../logbook.js";
+
+type ModeSVerdict = { eligible: true } | { eligible: false; reason: string };
+
+/** `LNR4778  LFSB->LFRS` -- the identity every decision line opens with. */
+function who(obs: Observation): string {
+  return `${obs.callsign.padEnd(8)} ${obs.departure ?? "????"}->${obs.arrival ?? "????"}`;
+}
 
 export interface TickStats {
   at: number;
@@ -233,8 +241,10 @@ export class Engine {
     let conspicuity = 0;
 
     for (const obs of queue) {
-      if (this.isModeSEligible(config, obs)) {
+      const modeS = this.modeSVerdict(config, obs);
+      if (modeS.eligible) {
         this.put(obs, codeBook.conspicuity, "auto", null, now);
+        logbook.record("auto", `${who(obs)}  -> ${codeBook.conspicuity}  Mode S conspicuity`);
         conspicuity++;
         assigned++;
         continue;
@@ -245,11 +255,21 @@ export class Engine {
       // be served from an any-destination range.
       const allocation = pools.allocate(obs.arrival, obs.callsign);
       if (!allocation) {
+        logbook.record("auto", `${who(obs)}  -> NO CODE  every pool serving this destination is full`);
         exhausted++;
         continue;
       }
       if (allocation.wildcard) wildcard++;
       this.put(obs, allocation.code, "auto", allocation.range, now);
+      // The reason rides along with the code it produced: a discrete assignment
+      // and the refusal of 1000 that caused it are one decision, not two.
+      logbook.record(
+        "auto",
+        `${who(obs)}  -> ${allocation.code}` +
+          `${allocation.range ? `  [${allocation.range}]` : ""}` +
+          `${allocation.wildcard ? "  (any-destination)" : ""}` +
+          `  denied 1000: ${modeS.reason}`,
+      );
       assigned++;
     }
 
@@ -286,12 +306,25 @@ export class Engine {
     }
 
     // ---- Serialise --------------------------------------------------------
+    const wasReady = this.ready;
     if (this.warmupRemaining > 0) {
       this.warmupRemaining--;
     } else {
       this.ready = true;
     }
+    if (this.ready && !wasReady) {
+      logbook.record("status", `engine ready, serving ${this.assignments.size} assignments`);
+    }
     const dupes = this.ready ? this.rebuildSnapshot() : 0;
+
+    logbook.record(
+      "tick",
+      `observed=${feed.observations.length} scope=${inScope.length} ` +
+        `assigned=${assigned} (1000=${conspicuity}) adopted=${adopted} ` +
+        `released=${released} dupes=${dupes}` +
+        `${exhausted > 0 ? ` EXHAUSTED=${exhausted}` : ""}` +
+        `${this.ready ? "" : " (warming up)"} ${Date.now() - started}ms`,
+    );
 
     this.lastTick = {
       at: now,
@@ -317,7 +350,7 @@ export class Engine {
    * manual, with the exclusion list as an absolute floor apart from the
    * emergency codes config marks as manually assignable.
    */
-  setCode(callsign: string, code: string): ManualResult | ManualRejection {
+  setCode(callsign: string, code: string, controller: string | null = null): ManualResult | ManualRejection {
     const config = this.config;
     if (!config) return "unknown_callsign";
     if (!isWellFormed(code)) return "malformed_code";
@@ -339,6 +372,7 @@ export class Engine {
       this.put(obs, code, "manual", null, now);
     }
     if (config.codeBook.isExclusive(code)) config.pools.reserve(code, callsign);
+    logbook.record("manual", `SET   ${by(controller)}  ${obs ? who(obs) : callsign.padEnd(8)}  -> ${code}`);
     // Publish immediately: the next poll must not serve the pre-change code.
     if (this.ready) this.rebuildSnapshot();
     return { ssr: code, dupe: this.isDupe(callsign, code) };
@@ -352,7 +386,7 @@ export class Engine {
    * never be given 1000 again: pressing AUTO would drop it to a discrete code
    * and there would be no way back to conspicuity.
    */
-  forceReassign(callsign: string): ManualResult | ManualRejection {
+  forceReassign(callsign: string, controller: string | null = null): ManualResult | ManualRejection {
     const config = this.config;
     if (!config) return "unknown_callsign";
     const obs = this.observations.get(callsign);
@@ -365,15 +399,36 @@ export class Engine {
       config.pools.release(existing.code);
     }
 
-    if (obs && this.isModeSEligible(config, obs)) {
-      const code = config.codeBook.conspicuity;
-      this.reassign(obs, existing, code, null, "auto", now);
-      if (this.ready) this.rebuildSnapshot();
-      return { ssr: code, dupe: this.isDupe(callsign, code) };
+    // No observation means the flight is out of the feed, so there is no route
+    // to test and conspicuity cannot be justified.
+    let denied = "flight is not in the datafeed";
+
+    if (obs) {
+      const modeS = this.modeSVerdict(config, obs);
+      if (modeS.eligible) {
+        const code = config.codeBook.conspicuity;
+        this.reassign(obs, existing, code, null, "auto", now);
+        logbook.record("manual", `AUTO  ${by(controller)}  ${who(obs)}  -> ${code}  Mode S conspicuity`);
+        if (this.ready) this.rebuildSnapshot();
+        return { ssr: code, dupe: this.isDupe(callsign, code) };
+      }
+      denied = modeS.reason;
     }
 
     const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
-    if (!allocation) return "pool_exhausted";
+    if (!allocation) {
+      logbook.record("manual", `AUTO  ${by(controller)}  ${callsign}  -> REJECTED  pool exhausted`);
+      return "pool_exhausted";
+    }
+
+    // The line a controller comes looking for after pressing AUTO and getting a
+    // discrete code back.
+    logbook.record(
+      "manual",
+      `AUTO  ${by(controller)}  ${obs ? who(obs) : callsign.padEnd(8)}  -> ${allocation.code}` +
+        `${allocation.range ? `  [${allocation.range}]` : ""}` +
+        `  denied 1000: ${denied}`,
+    );
 
     this.reassign(obs, existing, allocation.code, allocation.range, "auto", now);
     // Publish immediately: the next poll must not serve the pre-change code.
@@ -392,7 +447,7 @@ export class Engine {
    * has deliberately overridden the server, and that has to survive the flight
    * being reassigned for any other reason.
    */
-  forceDiscrete(callsign: string): ManualResult | ManualRejection {
+  forceDiscrete(callsign: string, controller: string | null = null): ManualResult | ManualRejection {
     const config = this.config;
     if (!config) return "unknown_callsign";
     const obs = this.observations.get(callsign);
@@ -406,9 +461,17 @@ export class Engine {
     }
 
     const allocation = config.pools.allocate(obs?.arrival ?? null, callsign);
-    if (!allocation) return "pool_exhausted";
+    if (!allocation) {
+      logbook.record("manual", `DISC  ${by(controller)}  ${callsign}  -> REJECTED  pool exhausted`);
+      return "pool_exhausted";
+    }
 
     this.reassign(obs, existing, allocation.code, allocation.range, "manual", now);
+    logbook.record(
+      "manual",
+      `DISC  ${by(controller)}  ${obs ? who(obs) : callsign.padEnd(8)}  -> ${allocation.code}` +
+        `${allocation.range ? `  [${allocation.range}]` : ""}  Mode S bypassed on request`,
+    );
     if (this.ready) this.rebuildSnapshot();
     return { ssr: allocation.code, dupe: this.isDupe(callsign, allocation.code) };
   }
@@ -461,14 +524,30 @@ export class Engine {
   /**
    * Mode S 1000 eligibility: capable equipment, a destination in a
    * participating state, and a REMAINING route that stays inside the area.
+   *
+   * Returns the reason rather than a bare false. "Why did this flight not get
+   * 1000" is the question the logbook exists to answer, and the answer only
+   * exists here: by the time the caller holds a discrete code, every
+   * distinction between the three ways of failing has been thrown away.
    */
-  private isModeSEligible(config: ConfigSnapshot, obs: Observation): boolean {
-    if (!isModeSCapable(obs.equipment)) return false;
-    if (!destinationParticipates(obs.arrival, this.modeSStates)) return false;
+  private modeSVerdict(config: ConfigSnapshot, obs: Observation): ModeSVerdict {
+    if (!isModeSCapable(obs.equipment)) {
+      return {
+        eligible: false,
+        reason: `equipment ${obs.equipment ?? "(not filed)"} is not Mode S capable`,
+      };
+    }
+    if (!destinationParticipates(obs.arrival, this.modeSStates)) {
+      return {
+        eligible: false,
+        reason: `destination ${obs.arrival ?? "(not filed)"} is not a participating state`,
+      };
+    }
     const points = this.routeCache.expand(
       config.navdata, obs.departure, obs.arrival, obs.route,
     );
-    return remainingRouteInside(config.navdata, points, obs.latitude, obs.longitude).inside;
+    const remaining = remainingRouteInside(config.navdata, points, obs.latitude, obs.longitude);
+    return remaining.inside ? { eligible: true } : { eligible: false, reason: remaining.reason };
   }
 
   private isDupe(callsign: string, code: Squawk): boolean {

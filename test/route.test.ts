@@ -48,6 +48,16 @@ describe("field 15 route expansion", () => {
     assert.deepEqual(expandRoute(NAVDATA, "LFSB", "LFRS", "COHPA RESMI UN491 DITAL"), EXPANDED);
   });
 
+  it("strips a change of flight rules from a point", () => {
+    // DISVU/N0290VFR is the point a flight goes VFR. `VFR` sits where the level
+    // normally would, so a pattern expecting only levels leaves the whole token
+    // standing as a fix name nothing can resolve.
+    assert.deepEqual(expandRoute(NAVDATA, "LFSB", "LFRS", "COHPA RESMI/N0290VFR"), [
+      "COHPA",
+      "RESMI",
+    ]);
+  });
+
   it("still marks an airway whose exit fix genuinely is not on it", () => {
     // The suffix must not become a way to paper over a real mismatch: NOWAY is
     // not on UN491 with or without one.

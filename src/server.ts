@@ -10,6 +10,7 @@ import { verifyGithubSignature, verifyToken } from "./auth.js";
 import type { ConfigSnapshot } from "./config/loader.js";
 import type { Engine } from "./engine/engine.js";
 import { env } from "./env.js";
+import { by, logbook } from "./logbook.js";
 import type { PersistenceStore } from "./store/redis.js";
 
 const run = promisify(execFile);
@@ -72,6 +73,7 @@ export function buildServer(services: Services): FastifyInstance {
   );
 
   registerHealth(app, services);
+  registerLogs(app, services);
   registerSnapshot(app, services);
   registerManual(app, services);
   registerWebhook(app, services);
@@ -113,6 +115,51 @@ function registerHealth(app: FastifyInstance, services: Services): void {
       routeCache: engine.routeCacheStats,
       lastTick: engine.stats,
     });
+  });
+}
+
+// -------------------------------------------------------------------- logs
+
+interface LogsQuery {
+  /** Keep only the most recent N matching lines. */
+  lines?: string;
+  /** Case-insensitive substring: a callsign, an airport, a category. */
+  q?: string;
+}
+
+/** Without a limit the whole buffer is served, which is a few hundred kB. */
+const DEFAULT_LOG_LINES = 500;
+
+function registerLogs(app: FastifyInstance, services: Services): void {
+  app.get<{ Querystring: LogsQuery }>("/logs", async (req, reply) => {
+    const parsed = Number.parseInt(req.query.lines ?? "", 10);
+    const limit = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, logbook.size) : DEFAULT_LOG_LINES;
+
+    const config = services.config();
+    // A header, so a line pulled out of context still says which process and
+    // which navdata produced it.
+    const header = [
+      `# Central Squawk -- ${new Date().toISOString()}`,
+      `# uptime ${Math.round(process.uptime())}s` +
+        `  engine ${services.engine.isReady ? "ready" : "warming"}` +
+        `  datafeed ${services.feedHealthy() ? "ok" : "STALE"}` +
+        `  redis ${services.store.isConnected ? "connected" : "disconnected"}` +
+        `  navdata ${config?.navdata.cycle ?? "none"}` +
+        `  assignments ${services.engine.size}`,
+      `# ${logbook.size} lines held` +
+        `${req.query.q ? `, filtered on "${req.query.q}"` : ""}` +
+        `, showing at most ${limit}`,
+      "#",
+      "# /logs?q=AFR1234        one flight",
+      "# /logs?q=denied+1000    every refusal of Mode S conspicuity",
+      "# /logs?lines=2000       further back",
+      "",
+    ].join("\n");
+
+    reply.header("content-type", "text/plain; charset=utf-8");
+    // Diagnostics go stale in one tick; never let a proxy hold on to them.
+    reply.header("cache-control", "no-store");
+    return reply.send(header + logbook.render({ limit, ...(req.query.q ? { q: req.query.q } : {}) }));
   });
 }
 
@@ -174,6 +221,7 @@ function registerManual(app: FastifyInstance, services: Services): void {
       return reply.code(400).send({ error: "callsign and controller are required" });
     }
     if (!verifyToken(env.authSecret, controller, token)) {
+      logbook.record("manual", `${by(controller.toUpperCase())}  ${callsign.toUpperCase()}  -> REFUSED  bad token`);
       return reply.code(403).send({ error: "not_authorised" });
     }
     if (!services.engine.isReady) {
@@ -181,13 +229,19 @@ function registerManual(app: FastifyInstance, services: Services): void {
     }
 
     const target = callsign.toUpperCase();
+    const actor = controller.toUpperCase();
     const result = code
-      ? services.engine.setCode(target, code)
+      ? services.engine.setCode(target, code, actor)
       : mode === "discrete"
-        ? services.engine.forceDiscrete(target)
-        : services.engine.forceReassign(target);
+        ? services.engine.forceDiscrete(target, actor)
+        : services.engine.forceReassign(target, actor);
 
     if (typeof result === "string") {
+      // The engine logs the rejections it can explain; these are the ones it
+      // never saw, because they failed before it was reached.
+      if (result === "unknown_callsign" || result === "malformed_code" || result === "excluded_code") {
+        logbook.record("manual", `${by(actor)}  ${target}  -> REJECTED  ${result}`);
+      }
       return reply.code(REJECTION_STATUS[result] ?? 400).send({ error: result });
     }
     req.log.info(
@@ -213,6 +267,7 @@ function registerWebhook(app: FastifyInstance, services: Services): void {
       await run("git", ["pull", "origin", env.configBranch], { cwd: env.configDir });
     } catch (err) {
       req.log.error({ err }, "config pull failed");
+      logbook.record("config", `pull failed: ${(err as Error).message}`);
       return reply.code(500).send({ error: "pull failed" });
     }
 
@@ -221,6 +276,7 @@ function registerWebhook(app: FastifyInstance, services: Services): void {
     } catch (err) {
       // The running snapshot is untouched: a bad config cannot stop assignment.
       req.log.error({ err }, "config rejected, keeping the running snapshot");
+      logbook.record("config", `REJECTED, keeping the running snapshot: ${(err as Error).message}`);
       return reply.code(422).send({
         error: "config rejected",
         detail: (err as Error).message,
@@ -229,6 +285,7 @@ function registerWebhook(app: FastifyInstance, services: Services): void {
 
     const config = services.config();
     req.log.info("config reloaded");
+    logbook.record("config", `reloaded, navdata AIRAC ${config?.navdata.cycle ?? "unknown"}`);
     return reply.send({
       status: "reloaded",
       cycle: config?.navdata.cycle ?? null,
