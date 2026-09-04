@@ -47,8 +47,13 @@ export function destinationParticipates(
 /**
  * Speed/level groups: `N0450F350`, `M085F400`, `K0880S1130`.
  * Speed is knots, Mach or km/h; level is flight level, metric level or altitude.
+ *
+ * `VFR` stands in for the level at a change of flight rules -- `DISVU/N0290VFR`
+ * is the point a flight goes VFR, not a fix called DISVU/N0290VFR. Missing that
+ * form leaves an unknown point in the route and silently costs the flight its
+ * conspicuity code.
  */
-const SPEED_LEVEL = /^(?:[KN]\d{4}|M\d{3})[FSAM]\d{3,4}$/;
+const SPEED_LEVEL = /^(?:[KN]\d{4}|M\d{3})(?:[FSAM]\d{3,4}|VFR)$/;
 /** Tokens that carry no position and are simply skipped. */
 const IGNORED_TOKENS = new Set(["DCT", "SID", "STAR", "IFR", "VFR"]);
 
@@ -110,6 +115,19 @@ export function isUnresolved(point: string): boolean {
  * is, which is what lets the result be cached and shared between every flight
  * filing the same route.
  */
+/**
+ * The point a field 15 token names, dropping any speed or level change attached
+ * to it: `DITAL/N0389F270` -> `DITAL`, `UN491` -> `UN491`.
+ *
+ * Applied to every token, including the one peeked at as an airway's exit fix --
+ * a suffix left on there makes the whole airway unexpandable.
+ */
+function pointName(token: string): string {
+  const slash = token.indexOf("/");
+  if (slash <= 0) return token;
+  return SPEED_LEVEL.test(token.slice(slash + 1)) ? token.slice(0, slash) : token;
+}
+
 export function expandRoute(
   navdata: Navdata,
   departure: string | null,
@@ -125,15 +143,7 @@ export function expandRoute(
   const points: string[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
-    let token = tokens[i]!;
-
-    // Field 15 marks a speed or level change at a point as POINT/SPEEDLEVEL,
-    // for example RANUX/N0449F390. The point is what matters here.
-    const slash = token.indexOf("/");
-    if (slash > 0) {
-      const tail = token.slice(slash + 1);
-      if (SPEED_LEVEL.test(tail)) token = token.slice(0, slash);
-    }
+    const token = pointName(tokens[i]!);
 
     if (IGNORED_TOKENS.has(token) || SPEED_LEVEL.test(token)) continue;
 
@@ -146,7 +156,11 @@ export function expandRoute(
     const chains = navdata.airways.get(token);
     if (chains) {
       const entry = points.at(-1) ?? null;
-      const exit = tokens[i + 1] ?? null;
+      // pointName again: the exit fix is just as likely to carry a speed/level
+      // change as any other point, and `UN491 DITAL/N0389F270` must leave the
+      // airway at DITAL, not at a name no chain can contain.
+      const next = tokens[i + 1];
+      const exit = next === undefined ? null : pointName(next);
       const walked = walkAirway(chains, entry, exit);
       if (!walked) {
         // Cannot expand it. Leave a marker so the segment is treated as

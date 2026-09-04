@@ -12,7 +12,7 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "docker": "docker compose down -v && docker compose up --build",
-    "test": "node --import tsx --test test/engine.test.ts"
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "fastify": "^5.2.1",
