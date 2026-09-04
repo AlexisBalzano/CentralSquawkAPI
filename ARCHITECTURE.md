@@ -250,6 +250,38 @@ result. Serving either encoding is a buffer write; the route picks one from
 
 Measured on live traffic: 2874 bytes raw, 700 gzipped, 4.1x.
 
+### Datafeed phase locking
+
+The feed regenerates every 15.000 s, but a generation only becomes fetchable
+some seconds after the timestamp it carries -- VATSIM's own processing and CDN
+propagation, measured at 22 s one morning and 11 s the same afternoon. Nothing
+on this side shortens that.
+
+What polling does control is the extra 0-15 s spent waiting to notice a new
+generation, and a fixed `setInterval` controls it badly. Our period and VATSIM's
+are both 15.000 s, so every poll returns exactly one new generation whatever the
+phase: the offset a container happens to boot with is held for the whole
+session, and an unlucky start reads the stalest possible feed every single tick
+for hours.
+
+So the poller schedules from the feed's own timestamp instead. It tracks the
+shortest gap it has seen between a generation's timestamp and catching it, and
+aims each poll just past when the next one should land. Finding that edge needs
+a probe -- a fixed period never produces a duplicate, whatever the phase -- so
+until it is found each poll creeps slightly earlier than the last. The first
+duplicate IS the edge: it proves the generation had not yet arrived, which
+brackets the delivery delay to within one creep step. From there the creep drops
+out and the phase simply holds.
+
+A duplicate after locking means delivery has slipped, and nudges the estimate
+back up. Without that the estimate could only ever fall, and a single unusually
+fast generation would leave the poller early -- and duplicating -- for good.
+
+In practice it locks within a few ticks and then sits within a second of each
+arrival, which shows up in the tick line as `askLagMs` holding steady. Steady
+state costs one request per generation, the same 4/min as before; probes add a
+handful during convergence and one per slip after it.
+
 `/logs` serves an in-memory ring buffer, separate from pino. pino goes to the
 container's stdout, where an operator looks; `/logs` is for the controller who
 wants to know why the flight in front of them got 7201 rather than 1000 and has
