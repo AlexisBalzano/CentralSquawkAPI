@@ -28,14 +28,87 @@ repository. The container image carries no airspace knowledge at all.
 
 ## Runtime topology
 
-**One instance.** The reconciliation loop is single-writer by construction, and
-running two would mean two schedulers allocating from pools they each believe
-they own. Coordination was considered and rejected: at 60 controllers polling a
-~2.4 KiB gzipped snapshot, load is a rounding error, and leader election would
-be pure risk for no throughput.
+**One instance per world.** The reconciliation loop is single-writer by
+construction, and running two against the same world would mean two schedulers
+allocating from pools they each believe they own. Coordination was considered
+and rejected: at 60 controllers polling a ~2.4 KiB gzipped snapshot, load is a
+rounding error, and leader election would be pure risk for no throughput.
 
 A restart costs a brief `503` while the warm-up ticks run. That is deliberate,
 not a defect — see *Warm-up* below.
+
+### Feed source, and the simulator instance
+
+`FEED_SOURCE` decides where observations come from:
+
+| Value | Behaviour |
+| --- | --- |
+| `vatsim` (default) | Polls the datafeed. Production. |
+| `push` | Does not poll at all. A client supplies the picture on `POST /api/feed`. |
+
+A sweatbox has no datafeed behind it, so a simulator session has to describe
+itself. It runs as **a second instance of this same image** with
+`FEED_SOURCE=push` and its own Redis. Which instance a plugin talks to is
+settled below, and not by asking EuroScope.
+
+#### The connection type is not the boundary
+
+The obvious design is for the plugin to read EuroScope's connection type and
+pick a server. It does read it, but it cannot be trusted alone: EuroScope
+reports `SWEATBOX` only for the machine **running** the session. A student joins
+a sweatbox by connecting normally and picking the training server, which
+EuroScope reports as `DIRECT`, identically to VATSIM. The participants who do
+the assigning are exactly the ones it gets wrong, and a plugin that trusted it
+would seed sweatbox aircraft into the live map and hold real ORCAM codes for
+them.
+
+So the boundary is enforced here, where the answer is actually knowable. The
+datafeed lists every controller logged on, so **`/api/assign` refuses any
+callsign the roster does not contain** (`not_on_network`, 403). It does not
+depend on the client being right about anything, which is the point:
+`test/network-gate.test.ts` pins it.
+
+Two properties make that safe to run:
+
+- **The roster is held, not cleared,** when a feed carries none. A generation we
+  failed to fetch says nothing about who is logged on, and dropping it would
+  refuse every controller in the country.
+- **Absent and empty are different.** `controllers: undefined` means "cannot
+  judge" and refuses nobody, which is what a push-mode instance and a cold start
+  both are. An empty set means "nobody is controlling", which is an answer.
+
+`GET /api/network?controller=…` publishes the same fact unauthenticated — who is
+logged on is in the datafeed already — so a plugin can point itself at the right
+server before a controller needs a code rather than after being turned away.
+
+Isolation is the whole reason it is also a separate instance rather than a flag
+threaded through the engine. Sim traffic sharing the live pool would consume
+real ORCAM codes and raise DUPEs against real aircraft, and sweatbox callsigns
+collide with live ones by design. Making it a deployment fact means
+`POST /api/feed` **is not registered at all** on a production instance: there is
+no route there to send anything to, whatever anybody sends. `test/feed-disabled.test.ts`
+pins that.
+
+Both modes run the identical `ingest` path — tick, persist, mark the feed alive —
+so the engine never learns which mode it is in. Only two things differ:
+
+- **Warm-up defaults to 0.** Warm-up exists because a first datafeed generation
+  can arrive partial. A pushed feed never is: the client sends the whole picture
+  or nothing. Waiting would only open a session with half a minute of `503`.
+- **`generatedAt` is stamped server-side**, never taken from the payload. Every
+  age the tick computes is measured against it, so a client whose clock is
+  minutes off would otherwise expire or preserve the map wholesale.
+
+**The feeder lease.** Every EuroScope in a sweatbox sees the same traffic, so
+without arbitration they would all push and the map would be rebuilt several
+times a tick from pictures that disagree about who is where. The first client to
+push claims the lease; everyone else gets `409 not_the_feeder` naming the holder.
+It renews on every push and is taken over only once stale (`FEEDER_LEASE_SEC`,
+default 45), which makes an instructor whose EuroScope crashes a few seconds of
+degradation rather than the end of the session. A displaced client still sends
+the **whole** picture when it probes for the lease — winning it with an empty
+push would tick the engine against an empty world and start the grace clock on
+every flight in the session.
 
 ## Module map
 
@@ -43,7 +116,7 @@ not a defect — see *Warm-up* below.
 | --- | --- |
 | `src/index.ts` | Bootstrap, poll loop, graceful shutdown |
 | `src/env.ts` | Process environment. Operational knobs only |
-| `src/server.ts` | Fastify instance, all four routes |
+| `src/server.ts` | Fastify instance and every route |
 | `src/auth.ts` | Controller token and GitHub webhook signature |
 | `src/geo.ts` | Point-in-polygon, distance-to-edge, `Area` |
 | `src/config/schema.ts` | Config shape and its validator |
@@ -51,10 +124,11 @@ not a defect — see *Warm-up* below.
 | `src/domain/types.ts` | Domain types |
 | `src/domain/codes.ts` | Code classification |
 | `src/domain/pools.ts` | Per-FIR ORCAM pools, reservation, allocation |
+| `src/domain/observation.ts` | Parses and sanitises client-supplied observations |
 | `src/navdata/navdata.ts` | Parsers for `fix.txt`, `airway.txt`, `procedure.txt` |
 | `src/navdata/modes.ts` | Mode S eligibility, route tokeniser, route cache |
 | `src/engine/engine.ts` | The reconciliation tick and manual operations |
-| `src/vatsim/datafeed.ts` | Datafeed fetch and narrowing |
+| `src/vatsim/datafeed.ts` | Datafeed fetch, narrowing, and the controller roster |
 | `src/store/redis.ts` | Persistence sink |
 
 ## The reconciliation tick
@@ -103,6 +177,41 @@ partial feed. Until the first full sweep completes, `GET /api/squawks` answers
 `503` was chosen over adding a `stale` field precisely so the payload contract
 stays exactly `{callsign: {ssr, dupe}}`. Clients keep their last snapshot and
 retry; nothing has to learn a new shape for a transient condition.
+
+### Client seeds
+
+A controller asks for a code the moment a pilot connects, which is a datafeed
+cycle or more before the feed carries them. The plugin therefore attaches the
+flight as the feed would have described it -- EuroScope received the same flight
+plan over the same FSD connection -- as an optional `flight` object on
+`POST /api/assign`.
+
+It is **not** a second lifecycle. The seed is held in `Engine.seeded` and merged
+into phase 1 as an ordinary observation, on exactly the same terms as the feed's
+own, so reserve, classify, allocate, release and DUPE need to know nothing about
+where an observation came from. That merge is also the whole of "forget the seed
+once the flight is real": a seed whose callsign the feed now carries is dropped
+rather than merged.
+
+Four properties keep it from being a hole in the authority model:
+
+1. **The datafeed always wins.** A seed for a callsign already observed is
+   ignored outright, not merged and not recorded.
+2. **The reported transponder is discarded** and replaced with `0000`. Phase 2
+   reserves every observed exclusive code before allocating, so a code taken on
+   a client's word would let any client drain the pool one claim at a time and
+   manufacture DUPEs against real traffic. A controller adopting the code an
+   aircraft really is squawking sends it as `code` instead, through the ordinary
+   manual path.
+3. **Position is validated against the padded zone**, so a seed cannot conjure a
+   flight into an airspace it is nowhere near.
+4. **`SEED_MAX_PER_CONTROLLER`** caps how many unconfirmed seeds one controller
+   may hold, so a buggy or hostile plugin has a bounded blast radius.
+
+An unconfirmed seed is released at `SEED_TTL_SEC` rather than on top of the
+grace period. The grace period exists so a flight that really was there can
+reconnect onto its code; a seed the feed never confirmed never was, and holding
+its code for five further minutes only strands it.
 
 ## Mode S eligibility
 
@@ -238,7 +347,9 @@ bind-mounted working tree would discard uncommitted work.
 | `GET /health` | Status, navdata cycle, pool utilisation, last tick stats |
 | `GET /logs` | Plain-text decision log. `?q=` filters, `?lines=` limits |
 | `GET /api/squawks` | The snapshot. gzip. `503` until the first sweep completes |
-| `POST /api/assign` | Manual set-code or force-reassign, answered synchronously |
+| `POST /api/assign` | Manual set-code or force-reassign, answered synchronously. Optional `flight` seeds a callsign the datafeed has not reached |
+| `GET /api/network` | Whether a controller callsign is logged on to this network. Unauthenticated |
+| `POST /api/feed` | The whole picture, for a simulator session. **Only registered when `FEED_SOURCE=push`** |
 | `POST /api/config-webhook` | HMAC-verified config reload |
 
 The snapshot is serialised **and gzipped once per tick**, not per request. Sixty
@@ -319,6 +430,21 @@ Break any of these and the service will still appear to work.
    than rejected config.
 6. **The tick is idempotent.** If a second pass over the same feed changes
    anything, there is hidden state.
+7. **A client seed is never trusted with a transponder.** It is the one path by
+   which a client writes into the authoritative map, and a trusted code there
+   defeats invariant 1 from the outside. A *pushed* observation is trusted with
+   one, and may only ever be, because `FEED_SOURCE=push` is a separate instance
+   with a separate pool and no real traffic to collide with.
+8. **`POST /api/feed` exists only in push mode.** Isolation between the
+   simulator and the live world is structural. The moment it becomes a runtime
+   check inside the engine, it is one missed branch away from sim traffic
+   holding real codes.
+9. **The live instance refuses a callsign it cannot see on the network.** This
+   is the only barrier that does not rely on a client knowing which world it is
+   in, and EuroScope cannot tell it: a student on a sweatbox reports `DIRECT`.
+   Anything that weakens this — trusting a client's claim about its own mode,
+   failing open when the roster is missing — puts invented traffic in the real
+   map holding real codes.
 
 ## Known gaps
 

@@ -8,21 +8,25 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 
 import { verifyGithubSignature, verifyToken } from "./auth.js";
 import type { ConfigSnapshot } from "./config/loader.js";
-import type { Engine } from "./engine/engine.js";
+import type { Engine, TickStats } from "./engine/engine.js";
 import { env } from "./env.js";
 import { by, logbook } from "./logbook.js";
+import { parsePushedFeed, parseSeed } from "./domain/observation.js";
 import type { PersistenceStore } from "./store/redis.js";
+import type { FeedResult } from "./vatsim/datafeed.js";
 
 const run = promisify(execFile);
 
 export interface Services {
   engine: Engine;
   store: PersistenceStore;
+  /** Run one reconciliation pass over a picture and persist the result. */
+  ingest: (feed: FeedResult) => Promise<TickStats>;
   /** Current snapshot, or null before the first successful load. */
   config: () => ConfigSnapshot | null;
   /** Re-read the config directory and swap the snapshot in if it validates. */
   reload: () => Promise<void>;
-  /** Whether the datafeed poller has succeeded recently. */
+  /** Whether a picture has arrived recently, by poll or by push. */
   feedHealthy: () => boolean;
 }
 
@@ -76,6 +80,8 @@ export function buildServer(services: Services): FastifyInstance {
   registerLogs(app, services);
   registerSnapshot(app, services);
   registerManual(app, services);
+  registerNetwork(app, services);
+  registerFeed(app, services);
   registerWebhook(app, services);
 
   return app;
@@ -111,6 +117,10 @@ function registerHealth(app: FastifyInstance, services: Services): void {
         ? { cycle: config.navdata.cycle, fixes: config.navdata.fixes.size, airways: config.navdata.airways.size }
         : null,
       assignments: engine.size,
+      // How many controllers the network shows logged on; null on a push instance.
+      controllersOnline: engine.rosterSize,
+      // Client seeds still waiting for the datafeed to confirm them.
+      seeds: engine.seedCount,
       pools: config?.pools.utilisation() ?? null,
       routeCache: engine.routeCacheStats,
       lastTick: engine.stats,
@@ -204,6 +214,13 @@ interface ManualBody {
    * code by hand. Defaults to "auto".
    */
   mode?: "auto" | "discrete";
+  /**
+   * The datafeed-shaped view of this flight, for a callsign the feed has not
+   * reached yet. EuroScope received the same flight plan over the same FSD
+   * connection the feed is built from, so the client can supply it a cycle
+   * early. Ignored outright when the feed already carries the callsign.
+   */
+  flight?: unknown;
 }
 
 const REJECTION_STATUS: Record<string, number> = {
@@ -212,11 +229,15 @@ const REJECTION_STATUS: Record<string, number> = {
   excluded_code: 409,
   not_authorised: 403,
   pool_exhausted: 503,
+  seed_malformed: 400,
+  seed_out_of_scope: 422,
+  seed_limit: 429,
+  not_on_network: 403,
 };
 
 function registerManual(app: FastifyInstance, services: Services): void {
   app.post<{ Body: ManualBody }>("/api/assign", async (req, reply) => {
-    const { callsign, controller, token, code, mode } = req.body ?? {};
+    const { callsign, controller, token, code, mode, flight } = req.body ?? {};
     if (!callsign || !controller) {
       return reply.code(400).send({ error: "callsign and controller are required" });
     }
@@ -230,6 +251,42 @@ function registerManual(app: FastifyInstance, services: Services): void {
 
     const target = callsign.toUpperCase();
     const actor = controller.toUpperCase();
+
+    // THE isolation boundary, and the only one that actually holds.
+    //
+    // EuroScope reports a student connected to a sweatbox through an ordinary
+    // connection as DIRECT, exactly as it reports VATSIM, so a plugin cannot
+    // know which world it is in and a controller who forgets to say so would
+    // otherwise write simulator traffic straight into the live pool -- seeding
+    // flights that do not exist and holding real ORCAM codes for them.
+    //
+    // The datafeed settles it: a callsign absent from the roster is not on this
+    // network, whatever its plugin believes. Refusing costs a genuine
+    // controller nothing but a retry in the ~20 s before their logon reaches
+    // the feed, and it is the difference between a forgotten command being an
+    // inconvenience and being a live incident.
+    if (env.feedSource === "vatsim") {
+      const online = services.engine.isControllerOnline(actor);
+      if (online === false) {
+        logbook.record("manual", `${by(actor)}  ${target}  -> REFUSED  not logged on to this network`);
+        return reply.code(REJECTION_STATUS.not_on_network!).send({ error: "not_on_network" });
+      }
+    }
+
+    // Seed before the operation, so the operation below finds the flight. A
+    // rejected seed fails the whole request rather than falling through to
+    // unknown_callsign, which would report the wrong reason for the refusal.
+    if (flight !== undefined && flight !== null) {
+      const seeded = parseSeed(target, flight);
+      const rejection = seeded
+        ? services.engine.seed(seeded, actor)
+        : ("seed_malformed" as const);
+      if (rejection) {
+        logbook.record("manual", `${by(actor)}  ${target}  -> REJECTED  ${rejection}`);
+        return reply.code(REJECTION_STATUS[rejection] ?? 400).send({ error: rejection });
+      }
+    }
+
     const result = code
       ? services.engine.setCode(target, code, actor)
       : mode === "discrete"
@@ -249,6 +306,124 @@ function registerManual(app: FastifyInstance, services: Services): void {
       "manual assignment",
     );
     return reply.send(result);
+  });
+}
+
+// ----------------------------------------------------------------- network
+
+interface NetworkQuery {
+  controller?: string;
+}
+
+/**
+ * `GET /api/network?controller=LFPG_TWR` -- "is this callsign on my network?"
+ *
+ * The same question the assign route answers by refusing, asked ahead of time
+ * so a plugin can point itself at the right server before a controller needs a
+ * code rather than after they have been turned away. No authentication: who is
+ * logged on is published in the datafeed itself.
+ *
+ * `onNetwork: null` means this instance cannot judge, which is the honest
+ * answer from a push-mode server -- it has no roster and refuses nobody.
+ */
+function registerNetwork(app: FastifyInstance, services: Services): void {
+  app.get<{ Querystring: NetworkQuery }>("/api/network", async (req, reply) => {
+    const controller = req.query.controller?.trim().toUpperCase();
+    if (!controller) {
+      return reply.code(400).send({ error: "controller is required" });
+    }
+
+    const online = env.feedSource === "vatsim"
+      ? services.engine.isControllerOnline(controller)
+      : null;
+
+    reply.header("cache-control", "no-store");
+    return reply.send({
+      controller,
+      onNetwork: online,
+      /** Whether this instance refuses callsigns it cannot see. */
+      enforced: env.feedSource === "vatsim" && services.engine.rosterSize !== null,
+      controllersOnline: services.engine.rosterSize,
+    });
+  });
+}
+
+// -------------------------------------------------------------- pushed feed
+
+interface FeedBody {
+  controller?: string;
+  token?: string;
+  observations?: unknown;
+}
+
+/**
+ * `POST /api/feed` -- the picture, for a world the VATSIM datafeed does not
+ * describe. Registered ONLY when FEED_SOURCE=push, so a production instance has
+ * no such route to send anything to.
+ *
+ * Exactly one client may feed a session at a time. Every EuroScope in a
+ * sweatbox sees the same traffic, so without a lease they would all push, and
+ * the map would be rebuilt several times a tick from pictures that disagree
+ * about who is where. The lease is claimed by whoever pushes first and renewed
+ * on every push; it is taken over only once it has gone stale, which makes a
+ * feeder that drops out self-healing rather than fatal.
+ */
+function registerFeed(app: FastifyInstance, services: Services): void {
+  if (env.feedSource !== "push") return;
+
+  const leaseMs = env.feederLeaseSec * 1000;
+  let feeder: { controller: string; until: number } | null = null;
+
+  app.post<{ Body: FeedBody }>("/api/feed", async (req, reply) => {
+    const { controller, token, observations } = req.body ?? {};
+    if (!controller) {
+      return reply.code(400).send({ error: "controller is required" });
+    }
+    if (!verifyToken(env.authSecret, controller, token)) {
+      return reply.code(403).send({ error: "not_authorised" });
+    }
+
+    const actor = controller.toUpperCase();
+    const now = Date.now();
+    if (feeder && feeder.controller !== actor && feeder.until > now) {
+      return reply.code(409).send({ error: "not_the_feeder", feeder: feeder.controller });
+    }
+
+    const feed = parsePushedFeed({ observations });
+    if (!feed) {
+      return reply.code(400).send({ error: "malformed_feed" });
+    }
+
+    const took = feeder?.controller !== actor;
+    feeder = { controller: actor, until: now + leaseMs };
+    if (took) {
+      req.log.info({ controller: actor }, "feeder lease claimed");
+      logbook.record("status", `${by(actor)}  now feeding the simulator picture`);
+    }
+
+    const stats = await services.ingest(feed);
+    req.log.info(
+      {
+        controller: actor,
+        observed: feed.observations.length,
+        skipped: feed.skipped,
+        inScope: stats.inScope,
+        assigned: stats.assigned,
+        released: stats.released,
+        dupes: stats.dupes,
+        ms: stats.durationMs,
+      },
+      "pushed feed",
+    );
+
+    // The feeder is usually a controller too, so hand back enough that it can
+    // tell a rejected push from an accepted one that simply saw nothing.
+    return reply.send({
+      accepted: feed.observations.length,
+      skipped: feed.skipped,
+      inScope: stats.inScope,
+      leaseSeconds: Math.round(leaseMs / 1000),
+    });
   });
 }
 

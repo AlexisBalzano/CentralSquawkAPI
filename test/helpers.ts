@@ -90,6 +90,10 @@ export function pilot(
   };
 }
 
-export function feed(observations: Observation[]): FeedResult {
-  return { generatedAt: Date.now(), observations, skipped: 0 };
+/**
+ * `generatedAt` is overridable so a test can advance the engine's clock without
+ * sleeping: every age the tick computes is measured against it.
+ */
+export function feed(observations: Observation[], generatedAt = Date.now()): FeedResult {
+  return { generatedAt, observations, skipped: 0 };
 }

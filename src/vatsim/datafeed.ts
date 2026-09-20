@@ -27,15 +27,35 @@ interface RawPilot {
   flight_plan?: RawFlightPlan | null;
 }
 
+interface RawController {
+  callsign?: string;
+}
+
 interface RawFeed {
   general?: { update_timestamp?: string };
   pilots?: RawPilot[];
+  controllers?: RawController[];
+  atis?: RawController[];
 }
 
 export interface FeedResult {
   /** When VATSIM generated the feed, not when we fetched it. */
   generatedAt: number;
   observations: Observation[];
+  /**
+   * Every controller and ATIS callsign currently logged on to VATSIM.
+   *
+   * Nothing to do with assignment: this is how the server answers "is the
+   * client asking me for a code actually on this network?". EuroScope cannot
+   * tell a sweatbox apart from VATSIM when a student connects to a training
+   * server through an ordinary connection -- it reports both as DIRECT -- so
+   * the client genuinely does not know which world it is in. The datafeed does.
+   *
+   * Absent (rather than empty) on a pushed feed, which carries no roster. That
+   * distinction is load-bearing: absent means "cannot judge", empty means
+   * "nobody is logged on", and only the second is grounds to refuse anyone.
+   */
+  controllers?: ReadonlySet<string>;
   /** Pilots dropped because a field we depend on was missing or malformed. */
   skipped: number;
 }
@@ -112,5 +132,19 @@ export async function fetchDatafeed(
     });
   }
 
-  return { generatedAt: Number.isFinite(generatedAt) ? generatedAt : Date.now(), observations, skipped };
+  // ATIS connections are listed separately from controllers and are included
+  // here too. One would never assign a squawk, but leaving them out would mean
+  // refusing a callsign the network plainly shows as logged on.
+  const controllers = new Set<string>();
+  for (const entry of [...(feed.controllers ?? []), ...(feed.atis ?? [])]) {
+    const callsign = entry.callsign?.trim().toUpperCase();
+    if (callsign) controllers.add(callsign);
+  }
+
+  return {
+    generatedAt: Number.isFinite(generatedAt) ? generatedAt : Date.now(),
+    observations,
+    controllers,
+    skipped,
+  };
 }

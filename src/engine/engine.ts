@@ -36,6 +36,22 @@ import { by, logbook } from "../logbook.js";
 
 type ModeSVerdict = { eligible: true } | { eligible: false; reason: string };
 
+/**
+ * A flight a controller asked about before the datafeed carried it.
+ *
+ * Deliberately NOT a parallel lifecycle: a seed is merged into phase 1 as an
+ * ordinary observation and dropped the moment the feed carries the same
+ * callsign, so reserve, classify, allocate, release and DUPE all see one
+ * uniform observation set and need to know nothing about where it came from.
+ */
+interface Seed {
+  obs: Observation;
+  /** Held across re-seeds, so re-sending cannot extend the TTL indefinitely. */
+  seededAt: number;
+  /** Who asked, for the per-controller cap and for the logbook. */
+  controller: string | null;
+}
+
 /** `LNR4778  LFSB->LFRS` -- the identity every decision line opens with. */
 function who(obs: Observation): string {
   return `${obs.callsign.padEnd(8)} ${obs.departure ?? "????"}->${obs.arrival ?? "????"}`;
@@ -68,6 +84,16 @@ export class Engine {
    * alone makes those two indistinguishable.
    */
   private readonly observedAnywhere = new Map<string, Observation>();
+  /** Client seeds still waiting for the datafeed to confirm them. See Seed. */
+  private readonly seeded = new Map<string, Seed>();
+  /**
+   * Controller and ATIS callsigns logged on to VATSIM as of the last feed.
+   *
+   * Null until a feed carrying a roster has arrived, which on a push-mode
+   * instance is never. Null means "cannot judge" and nobody is refused; a set
+   * -- even an empty one -- means the answer is known.
+   */
+  private roster: ReadonlySet<string> | null = null;
   private readonly routeCache = new RouteCache();
   /**
    * Who was transmitting which exclusive code as of the last tick, kept so the
@@ -81,7 +107,17 @@ export class Engine {
   private ready = false;
   private lastTick: TickStats | null = null;
 
-  constructor(private readonly warmupCycles: number) {
+  constructor(
+    private readonly warmupCycles: number,
+    /**
+     * How long an unconfirmed seed survives. A pilot who really is connected
+     * reaches the feed inside two generations, so anything still unconfirmed
+     * after this was never there: a typo in the callsign, or a client bug.
+     */
+    private readonly seedTtlMs = 120_000,
+    /** Unconfirmed seeds one controller may hold at once. */
+    private readonly seedLimit = 10,
+  ) {
     this.warmupRemaining = warmupCycles;
   }
 
@@ -131,6 +167,31 @@ export class Engine {
     return this.assignments.size;
   }
 
+  /** Client seeds still waiting for the datafeed to confirm them. */
+  get seedCount(): number {
+    return this.seeded.size;
+  }
+
+  /** How many controllers the last feed showed logged on; null if unknown. */
+  get rosterSize(): number | null {
+    return this.roster?.size ?? null;
+  }
+
+  /**
+   * Whether a controller callsign is logged on to the network this server
+   * describes. Null when there is no roster to judge by, which is the case on
+   * a push-mode instance and before the first datafeed arrives.
+   *
+   * This is the only reliable answer to "is the client talking to me actually
+   * on my network?". EuroScope reports a student connected to a training
+   * server through an ordinary connection as DIRECT, identically to VATSIM, so
+   * no amount of care on the client can establish it.
+   */
+  isControllerOnline(callsign: string): boolean | null {
+    if (!this.roster) return null;
+    return this.roster.has(callsign.trim().toUpperCase());
+  }
+
   all(): Assignment[] {
     return [...this.assignments.values()];
   }
@@ -150,6 +211,11 @@ export class Engine {
     const now = feed.generatedAt || started;
     const groundThreshold = raw.timing.groundSpeedThresholdKt;
 
+    // Held from the last feed that carried one, rather than cleared when one
+    // does not. A feed we failed to fetch says nothing about who is logged on,
+    // and dropping the roster would refuse every controller in the country.
+    if (feed.controllers) this.roster = feed.controllers;
+
     // ---- Phase 1: observe -------------------------------------------------
     // Everything inside the padded zone. The wider zone is used here because
     // release is judged on it too, and a flight must stay observable right up
@@ -162,6 +228,28 @@ export class Engine {
       if (!aor.withinNm(obs.latitude, obs.longitude, raw.aor.zonePaddingNm)) continue;
       this.observations.set(obs.callsign, obs);
       inScope.push(obs);
+    }
+
+    // Client seeds are merged in as ordinary observations, on exactly the same
+    // terms as the feed's own. A seed the feed has caught up with is dropped
+    // rather than merged: the feed is authoritative, always, and this is the
+    // whole of "clear it from the temporary list once the flight is seen".
+    const expiredSeeds: string[] = [];
+    for (const [callsign, seed] of this.seeded) {
+      if (this.observedAnywhere.has(callsign)) {
+        this.seeded.delete(callsign);
+        logbook.record("manual", `SEED  ${callsign.padEnd(8)}  confirmed by the datafeed`);
+        continue;
+      }
+      if (now - seed.seededAt > this.seedTtlMs) {
+        this.seeded.delete(callsign);
+        expiredSeeds.push(callsign);
+        continue;
+      }
+      this.observedAnywhere.set(callsign, seed.obs);
+      if (!aor.withinNm(seed.obs.latitude, seed.obs.longitude, raw.aor.zonePaddingNm)) continue;
+      this.observations.set(callsign, seed.obs);
+      inScope.push(seed.obs);
     }
 
     // Who is transmitting what, for DUPE detection. Only exclusive codes can
@@ -277,6 +365,21 @@ export class Engine {
     let released = 0;
     const graceMs = raw.timing.gracePeriodSec * 1000;
 
+    // A seed the datafeed never confirmed. Released at the seed TTL rather than
+    // waiting out the grace period on top of it: the grace period exists so a
+    // flight that really was there can reconnect onto its code, and this one
+    // never was. Runs before the sweep below so these never reach it.
+    for (const callsign of expiredSeeds) {
+      const assignment = this.assignments.get(callsign);
+      if (!assignment) continue;
+      this.drop(assignment, pools);
+      released++;
+      logbook.record(
+        "manual",
+        `SEED  ${callsign.padEnd(8)}  -> RELEASED ${assignment.code}  never appeared in the datafeed`,
+      );
+    }
+
     for (const assignment of [...this.assignments.values()]) {
       const anywhere = this.observedAnywhere.get(assignment.callsign);
 
@@ -344,6 +447,55 @@ export class Engine {
   }
 
   // ------------------------------------------------------------- manual ops
+
+  /**
+   * Admit a client-supplied observation for a flight the datafeed has not
+   * reached yet, so the manual operation carrying it can be answered now rather
+   * than a datafeed cycle later.
+   *
+   * The seed is made visible to `observations` immediately, not merely queued
+   * for the next tick: the whole point is that the setCode/forceReassign call
+   * in this same request finds the flight. `seeded` is what carries it across
+   * subsequent ticks until the feed confirms it.
+   *
+   * Returns null when the seed was admitted OR harmlessly ignored. A client
+   * cannot know what the server has already observed, so seeding a flight the
+   * feed already carries is not an error -- it is simply dropped on the floor,
+   * because the feed outranks it.
+   */
+  seed(obs: Observation, controller: string | null): ManualRejection | null {
+    const config = this.config;
+    if (!config) return "unknown_callsign";
+
+    if (this.observedAnywhere.has(obs.callsign)) return null;
+
+    if (!config.aor.withinNm(obs.latitude, obs.longitude, config.raw.aor.zonePaddingNm)) {
+      return "seed_out_of_scope";
+    }
+
+    const existing = this.seeded.get(obs.callsign);
+    if (!existing) {
+      let held = 0;
+      for (const seed of this.seeded.values()) {
+        if (seed.controller === controller) held++;
+      }
+      if (held >= this.seedLimit) return "seed_limit";
+    }
+
+    const now = Date.now();
+    this.seeded.set(obs.callsign, {
+      obs,
+      seededAt: existing?.seededAt ?? now,
+      controller,
+    });
+    this.observedAnywhere.set(obs.callsign, obs);
+    this.observations.set(obs.callsign, obs);
+
+    if (!existing) {
+      logbook.record("manual", `SEED  ${by(controller)}  ${who(obs)}  ahead of the datafeed`);
+    }
+    return null;
+  }
 
   /**
    * Set a specific code by hand. Accepted regardless of range and flagged

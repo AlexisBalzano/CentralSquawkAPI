@@ -84,4 +84,12 @@ export type ManualRejection =
   | "malformed_code"
   | "not_authorised"
   /** No range serving this flight's destination has a free code. */
-  | "pool_exhausted";
+  | "pool_exhausted"
+  /** A `flight` payload was sent but could not be parsed into an observation. */
+  | "seed_malformed"
+  /** The seeded position is outside the padded zone, so the flight is not ours. */
+  | "seed_out_of_scope"
+  /** This controller already holds the maximum number of unconfirmed seeds. */
+  | "seed_limit"
+  /** The callsign is not logged on to the network this server describes. */
+  | "not_on_network";

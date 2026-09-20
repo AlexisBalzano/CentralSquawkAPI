@@ -1,18 +1,22 @@
 /** Bootstrap: config, persistence, HTTP server, and the reconciliation loop. */
 
 import { loadConfigSnapshot, type ConfigSnapshot } from "./config/loader.js";
-import { Engine } from "./engine/engine.js";
+import { Engine, type TickStats } from "./engine/engine.js";
 import { env } from "./env.js";
 import { logbook } from "./logbook.js";
 import { buildServer, type Services } from "./server.js";
 import { PersistenceStore } from "./store/redis.js";
-import { fetchDatafeed } from "./vatsim/datafeed.js";
+import { fetchDatafeed, type FeedResult } from "./vatsim/datafeed.js";
 
-/** Feed considered stale after this long without a successful poll. */
+/** Feed considered stale after this long without a successful poll or push. */
 const FEED_STALE_MS = 90_000;
 
 async function main(): Promise<void> {
-  const engine = new Engine(env.warmupCycles);
+  const engine = new Engine(
+    env.warmupCycles,
+    env.seedTtlSec * 1000,
+    env.seedMaxPerController,
+  );
 
   let config: ConfigSnapshot | null = null;
   let lastFeedOk = 0;
@@ -39,9 +43,26 @@ async function main(): Promise<void> {
   await store.connect();
   engine.restore(await store.load());
 
+  /**
+   * One reconciliation pass over a picture, whatever produced it.
+   *
+   * Shared by the datafeed poller and by `POST /api/feed` so a simulator
+   * session and a live one run the identical sequence -- tick, persist, mark
+   * the feed alive. The engine never learns which mode it is in.
+   */
+  const ingest = async (feed: FeedResult): Promise<TickStats> => {
+    const stats = engine.tick(feed);
+    // A picture was accepted, which is what health actually means. In push mode
+    // this is the only thing that ever sets it.
+    lastFeedOk = Date.now();
+    await store.save(engine.all());
+    return stats;
+  };
+
   const services: Services = {
     engine,
     store,
+    ingest,
     config: () => config,
     reload: async () => {
       await reload();
@@ -168,7 +189,7 @@ async function main(): Promise<void> {
       const creep = locked ? 0 : PHASE_CREEP_MS;
       const nextAt = feed.generatedAt + tickMs() + pipelineLagMs + PHASE_MARGIN_MS - creep;
 
-      const stats = engine.tick(feed);
+      const stats = await ingest(feed);
       app.log.info(
         {
           inScope: stats.inScope,
@@ -189,7 +210,6 @@ async function main(): Promise<void> {
       if (stats.exhausted > 0) {
         app.log.error(`${stats.exhausted} flights got no code: every pool is full`);
       }
-      await store.save(engine.all());
 
       nextDelay = nextAt - Date.now();
     } catch (err) {
@@ -199,7 +219,14 @@ async function main(): Promise<void> {
     schedule(nextDelay);
   };
 
-  void poll();
+  // In push mode nothing is polled: the picture arrives on POST /api/feed, and
+  // until the first one does, /health and /api/squawks both say so.
+  if (env.feedSource === "push") {
+    app.log.warn("FEED_SOURCE=push -- the VATSIM datafeed is NOT polled, waiting for POST /api/feed");
+    logbook.record("status", "push feed mode: waiting for a client to supply the picture");
+  } else {
+    void poll();
+  }
 
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info(`${signal} received, shutting down`);
