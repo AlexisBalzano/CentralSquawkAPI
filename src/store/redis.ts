@@ -10,8 +10,24 @@
 import { createClient, type RedisClientType } from "redis";
 
 import type { Assignment } from "../domain/types.js";
+import { env } from "../env.js";
 
-const KEY = "centralsquawk:assignments";
+/**
+ * Where the map is persisted, kept apart per mode so the live and simulator
+ * instances can share one Redis without reading each other's state.
+ *
+ * Derived from `env.feedSource`, never from `process.env` directly, and with
+ * the live key as the fallthrough. Production does not set FEED_SOURCE at all;
+ * a test like `process.env.FEED_SOURCE == "vatsim"` is false there, so a live
+ * server that polls the datafeed would persist under the simulator's key --
+ * and on its next restart, restore a sweatbox session's aircraft into the live
+ * map holding real codes. The key has to follow the mode's own default.
+ */
+export function assignmentsKey(feedSource: typeof env.feedSource): string {
+  return feedSource === "push" ? "sweatbox:centralsquawk:assignments" : "centralsquawk:assignments";
+}
+
+const KEY = assignmentsKey(env.feedSource);
 
 export interface Logger {
   info(msg: string): void;

@@ -48,8 +48,18 @@ not a defect — see *Warm-up* below.
 
 A sweatbox has no datafeed behind it, so a simulator session has to describe
 itself. It runs as **a second instance of this same image** with
-`FEED_SOURCE=push` and its own Redis. Which instance a plugin talks to is
-settled below, and not by asking EuroScope.
+`FEED_SOURCE=push`. Which instance a plugin talks to is settled below, and not
+by asking EuroScope.
+
+The two instances may share one Redis. The map is persisted under a key derived
+from the mode — `centralsquawk:assignments` live, `sweatbox:centralsquawk:assignments`
+push — so neither restores the other's state on restart. That derivation goes
+through `env.feedSource` and falls through to the **live** key, because
+production does not set `FEED_SOURCE` at all: a key read raw from the
+environment would put a live server on the simulator's key, and its next
+restart would restore a sweatbox session's aircraft into the live map holding
+real codes. `test/persistence-key.test.ts` pins it. Two *simulator* instances on
+one Redis would share a key; a second one needs its own.
 
 #### The connection type is not the boundary
 
