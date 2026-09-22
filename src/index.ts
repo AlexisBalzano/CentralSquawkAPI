@@ -67,7 +67,7 @@ async function main(): Promise<void> {
     reload: async () => {
       await reload();
     },
-    feedHealthy: () => lastFeedOk > 0 && Date.now() - lastFeedOk < FEED_STALE_MS,
+    feedHealthy: () => (lastFeedOk > 0 && Date.now() - lastFeedOk < FEED_STALE_MS) || env.feedSource === "push",
   };
 
   const app = buildServer(services);
