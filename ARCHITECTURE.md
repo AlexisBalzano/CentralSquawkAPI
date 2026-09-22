@@ -44,7 +44,7 @@ not a defect — see *Warm-up* below.
 | Value | Behaviour |
 | --- | --- |
 | `vatsim` (default) | Polls the datafeed. Production. |
-| `push` | Does not poll at all. A client supplies the picture on `POST /api/feed`. |
+| `push` | Does not poll at all. The clients supply the picture on `POST /api/feed`. |
 
 A sweatbox has no datafeed behind it, so a simulator session has to describe
 itself. It runs as **a second instance of this same image** with
@@ -103,22 +103,45 @@ Both modes run the identical `ingest` path — tick, persist, mark the feed aliv
 so the engine never learns which mode it is in. Only two things differ:
 
 - **Warm-up defaults to 0.** Warm-up exists because a first datafeed generation
-  can arrive partial. A pushed feed never is: the client sends the whole picture
-  or nothing. Waiting would only open a session with half a minute of `503`.
+  can arrive partial. A pushed world fills in on its own as each client pushes,
+  and a code drawn before some picture arrived that turns out to be squawked
+  there yields in phase 2 like any other. Waiting would only open a session with
+  half a minute of `503`.
 - **`generatedAt` is stamped server-side**, never taken from the payload. Every
   age the tick computes is measured against it, so a client whose clock is
   minutes off would otherwise expire or preserve the map wholesale.
 
-**The feeder lease.** Every EuroScope in a sweatbox sees the same traffic, so
-without arbitration they would all push and the map would be rebuilt several
-times a tick from pictures that disagree about who is where. The first client to
-push claims the lease; everyone else gets `409 not_the_feeder` naming the holder.
-It renews on every push and is taken over only once stale (`FEEDER_LEASE_SEC`,
-default 45), which makes an instructor whose EuroScope crashes a few seconds of
-degradation rather than the end of the session. A displaced client still sends
-the **whole** picture when it probes for the lease — winning it with an empty
-push would tick the engine against an empty world and start the grace clock on
-every flight in the session.
+**Every client's picture counts.** No EuroScope sees the whole sweatbox: each
+only receives traffic inside its own visibility range, so the instructor running
+the scenario and a TWR student see different subsets of one world. Taking any
+one client's picture as the world — which is what a single feeder would do —
+leaves everything outside its range uncoded, and reads a flight that merely left
+that range as one that disconnected. So every client pushes, the server keeps
+each one's latest picture, and the engine ticks against their union
+(`src/domain/pictures.ts`). A flight is coded as soon as anyone can see it, and
+counts as absent only when nobody can.
+
+The union is sound because the clients share one FSD server, which refuses a
+second connection under a callsign already in use: one callsign in two pictures
+is one aircraft, seen twice. For the same reason it is **not** sound across
+servers. Sessions on different sweatbox servers are different worlds, and each
+needs its own instance.
+
+Three rules keep it honest, and `test/pictures.test.ts` pins each:
+
+- A push **replaces** its client's previous picture rather than adding to it. An
+  aircraft that has left every range has to be able to leave the world.
+- The **most recent** push carrying a callsign describes it. Clients see one
+  aircraft a few seconds apart, and the later view is the better one.
+- A picture **lapses** once its client has gone `FEEDER_LEASE_SEC` (default 45)
+  without pushing. The aircraft only it could see then go to the ordinary grace
+  period, rather than being held by a EuroScope that crashed.
+
+An empty push is therefore harmless: it withdraws its own client's view and
+nothing else. Every push ticks the engine, so a session with several clients
+ticks several times per push interval. The tick is idempotent and cheap at
+sweatbox scale, but each one writes a line to `/logs`, whose history covers
+correspondingly less time.
 
 ## Module map
 
@@ -135,6 +158,7 @@ every flight in the session.
 | `src/domain/codes.ts` | Code classification |
 | `src/domain/pools.ts` | Per-FIR ORCAM pools, reservation, allocation |
 | `src/domain/observation.ts` | Parses and sanitises client-supplied observations |
+| `src/domain/pictures.ts` | Merges the pictures simulator clients push into one world |
 | `src/navdata/navdata.ts` | Parsers for `fix.txt`, `airway.txt`, `procedure.txt` |
 | `src/navdata/modes.ts` | Mode S eligibility, route tokeniser, route cache |
 | `src/engine/engine.ts` | The reconciliation tick and manual operations |
@@ -359,7 +383,7 @@ bind-mounted working tree would discard uncommitted work.
 | `GET /api/squawks` | The snapshot. gzip. `503` until the first sweep completes |
 | `POST /api/assign` | Manual set-code or force-reassign, answered synchronously. Optional `flight` seeds a callsign the datafeed has not reached |
 | `GET /api/network` | Whether a controller callsign is logged on to this network. Unauthenticated |
-| `POST /api/feed` | The whole picture, for a simulator session. **Only registered when `FEED_SOURCE=push`** |
+| `POST /api/feed` | One client's picture of a simulator session, merged with every other client's. **Only registered when `FEED_SOURCE=push`** |
 | `POST /api/config-webhook` | HMAC-verified config reload |
 
 The snapshot is serialised **and gzipped once per tick**, not per request. Sixty
@@ -455,6 +479,10 @@ Break any of these and the service will still appear to work.
    Anything that weakens this — trusting a client's claim about its own mode,
    failing open when the roster is missing — puts invented traffic in the real
    map holding real codes.
+10. **A push replaces its client's picture, and a quiet client's picture
+    lapses.** A merge that only ever added would keep every flight any client
+    had ever seen: nothing would be released, and the map would fill with
+    aircraft that left the session hours ago.
 
 ## Known gaps
 

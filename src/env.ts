@@ -59,9 +59,10 @@ export const env = {
    * complete picture rather than a partial one.
    *
    * Zero by default in push mode: warm-up exists because the first datafeed
-   * generation can arrive partial, and a pushed feed never is -- the client
-   * sends the whole picture or nothing. Waiting would only open a simulator
-   * session with half a minute of 503.
+   * generation can arrive partial, and a pushed world fills in on its own as
+   * each client pushes. A code drawn before some picture arrived that turns out
+   * to be squawked there yields in phase 2 like any other. Waiting would only
+   * open a simulator session with half a minute of 503.
    */
   warmupCycles: int("WARMUP_CYCLES", feedSource === "push" ? 0 : 2),
 
@@ -79,11 +80,13 @@ export const env = {
   seedMaxPerController: int("SEED_MAX_PER_CONTROLLER", 10),
 
   /**
-   * Push mode only: how long a feeder keeps the lease without pushing again.
+   * Push mode only: how long a client's picture stays in the merged world
+   * without a fresh push. Each push renews that client's lease on its place in
+   * the merge.
    *
    * Long enough to ride out a missed push at any sane interval, short enough
-   * that an instructor whose EuroScope crashed is replaced within a few seconds
-   * rather than leaving the session with no picture at all.
+   * that the aircraft only a crashed EuroScope could see go to the grace period
+   * soon, rather than being held by a picture nobody is renewing.
    */
   feederLeaseSec: int("FEEDER_LEASE_SEC", 45),
 } as const;

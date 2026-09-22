@@ -12,6 +12,7 @@ import type { Engine, TickStats } from "./engine/engine.js";
 import { env } from "./env.js";
 import { by, logbook } from "./logbook.js";
 import { parsePushedFeed, parseSeed } from "./domain/observation.js";
+import { Pictures } from "./domain/pictures.js";
 import type { PersistenceStore } from "./store/redis.js";
 import type { FeedResult } from "./vatsim/datafeed.js";
 
@@ -357,22 +358,21 @@ interface FeedBody {
 }
 
 /**
- * `POST /api/feed` -- the picture, for a world the VATSIM datafeed does not
- * describe. Registered ONLY when FEED_SOURCE=push, so a production instance has
- * no such route to send anything to.
+ * `POST /api/feed` -- one client's picture of a world the VATSIM datafeed does
+ * not describe. Registered ONLY when FEED_SOURCE=push, so a production instance
+ * has no such route to send anything to.
  *
- * Exactly one client may feed a session at a time. Every EuroScope in a
- * sweatbox sees the same traffic, so without a lease they would all push, and
- * the map would be rebuilt several times a tick from pictures that disagree
- * about who is where. The lease is claimed by whoever pushes first and renewed
- * on every push; it is taken over only once it has gone stale, which makes a
- * feeder that drops out self-healing rather than fatal.
+ * Every client in the session pushes, and every push counts. No one EuroScope
+ * sees the whole sweatbox -- each only receives traffic inside its own
+ * visibility range -- so taking any single client's picture as the world would
+ * leave everything outside that range uncoded. Each push replaces its client's
+ * own picture, and the engine ticks against the union of every picture still
+ * live; `Pictures` holds the rules that keep that union honest.
  */
 function registerFeed(app: FastifyInstance, services: Services): void {
   if (env.feedSource !== "push") return;
 
-  const leaseMs = env.feederLeaseSec * 1000;
-  let feeder: { controller: string; until: number } | null = null;
+  const pictures = new Pictures(env.feederLeaseSec * 1000);
 
   app.post<{ Body: FeedBody }>("/api/feed", async (req, reply) => {
     const { controller, token, observations } = req.body ?? {};
@@ -384,29 +384,35 @@ function registerFeed(app: FastifyInstance, services: Services): void {
     }
 
     const actor = controller.toUpperCase();
-    const now = Date.now();
-    if (feeder && feeder.controller !== actor && feeder.until > now) {
-      return reply.code(409).send({ error: "not_the_feeder", feeder: feeder.controller });
-    }
-
-    const feed = parsePushedFeed({ observations });
-    if (!feed) {
+    const picture = parsePushedFeed({ observations });
+    if (!picture) {
       return reply.code(400).send({ error: "malformed_feed" });
     }
 
-    const took = feeder?.controller !== actor;
-    feeder = { controller: actor, until: now + leaseMs };
-    if (took) {
-      req.log.info({ controller: actor }, "feeder lease claimed");
-      logbook.record("status", `${by(actor)}  now feeding the simulator picture`);
+    const merged = pictures.submit(actor, picture);
+    for (const client of merged.lapsed) {
+      req.log.info({ controller: client }, "feeder lapsed");
+      logbook.record(
+        "status",
+        `${by(client)}  stopped feeding: no push for ${env.feederLeaseSec}s, picture dropped`,
+      );
+    }
+    if (merged.joined) {
+      req.log.info({ controller: actor, feeders: merged.feeders }, "feeder joined");
+      logbook.record(
+        "status",
+        `${by(actor)}  now feeding the simulator picture (${merged.feeders} feeding)`,
+      );
     }
 
-    const stats = await services.ingest(feed);
+    const stats = await services.ingest(merged.feed);
     req.log.info(
       {
         controller: actor,
-        observed: feed.observations.length,
-        skipped: feed.skipped,
+        observed: picture.observations.length,
+        skipped: picture.skipped,
+        world: merged.feed.observations.length,
+        feeders: merged.feeders,
         inScope: stats.inScope,
         assigned: stats.assigned,
         released: stats.released,
@@ -418,11 +424,13 @@ function registerFeed(app: FastifyInstance, services: Services): void {
 
     // The feeder is usually a controller too, so hand back enough that it can
     // tell a rejected push from an accepted one that simply saw nothing.
+    // `inScope` is the whole merged world's, not this picture's.
     return reply.send({
-      accepted: feed.observations.length,
-      skipped: feed.skipped,
+      accepted: picture.observations.length,
+      skipped: picture.skipped,
       inScope: stats.inScope,
-      leaseSeconds: Math.round(leaseMs / 1000),
+      feeders: merged.feeders,
+      leaseSeconds: env.feederLeaseSec,
     });
   });
 }

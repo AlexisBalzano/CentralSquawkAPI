@@ -1,10 +1,10 @@
 /**
- * Tests for `POST /api/feed` and the feeder lease.
+ * Tests for `POST /api/feed` and the merging of every client's picture.
  *
- * Every EuroScope in a sweatbox sees the same traffic, so without a lease they
- * would all push and the map would be rebuilt several times a tick from
- * pictures that disagree. The lease is the whole of that, and it is small
- * enough to get subtly wrong: hence a route-level test rather than a unit one.
+ * No EuroScope in a sweatbox sees all of it -- each only receives traffic
+ * inside its own visibility range -- so every push counts toward one world.
+ * `test/pictures.test.ts` pins the merge rules; these pin what the engine is
+ * finally handed, which is the part a client actually experiences.
  */
 
 // Set before the modules that read it are loaded. `env` snapshots the process
@@ -88,6 +88,7 @@ describe("the pushed feed route", () => {
       accepted: 2,
       skipped: 0,
       inScope: 2,
+      feeders: 1,
       leaseSeconds: 1,
     });
     assert.deepEqual(server.ticked, [2], "the engine ran once, on what was pushed");
@@ -117,36 +118,43 @@ describe("the pushed feed route", () => {
   });
 });
 
-describe("the feeder lease", () => {
+describe("merging every client's picture", () => {
   let server: Server;
   before(async () => {
     server = await build();
   });
 
-  it("goes to whoever pushes first", async () => {
-    assert.equal((await push(server, INSTRUCTOR, [target("SIM1")])).statusCode, 200);
+  function snapshot(): Record<string, unknown> {
+    return JSON.parse(server.engine.snapshotJson) as Record<string, unknown>;
+  }
+
+  it("accepts every client and ticks against what they see between them", async () => {
+    // Overlapping views: both see SIM2, only one sees each of the others.
+    assert.equal((await push(server, INSTRUCTOR, [target("SIM1"), target("SIM2")])).statusCode, 200);
+    const res = await push(server, TRAINEE, [target("SIM2"), target("SIM3")]);
+
+    assert.equal(res.statusCode, 200, "the second client is not turned away");
+    assert.equal(res.json().feeders, 2);
+    assert.equal(res.json().inScope, 3, "the union, with the shared aircraft counted once");
+    const served = snapshot();
+    assert.ok(served["SIM1"] && served["SIM2"] && served["SIM3"], "and every aircraft is coded");
   });
 
-  it("locks everyone else out while it is held", async () => {
-    const res = await push(server, TRAINEE, [target("SIM1")]);
-    assert.equal(res.statusCode, 409);
-    assert.equal(res.json().error, "not_the_feeder");
-    assert.equal(res.json().feeder, INSTRUCTOR, "and says who to blame");
+  it("does not let one client's empty picture blank anyone else's", async () => {
+    const res = await push(server, "LFPG_DEL", []);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().feeders, 3);
+    assert.equal(res.json().inScope, 3);
   });
 
-  it("renews on every push, so the holder never locks itself out", async () => {
-    assert.equal((await push(server, INSTRUCTOR, [target("SIM1")])).statusCode, 200);
-    assert.equal((await push(server, INSTRUCTOR, [target("SIM1")])).statusCode, 200);
-  });
-
-  it("is taken over once it goes stale, so a feeder that drops is not fatal", async () => {
-    // The instructor's EuroScope has crashed and stopped pushing.
+  it("drops a client that stops pushing, leaving its aircraft to the grace period", async () => {
+    // The instructor's EuroScope has crashed; the trainee carries on.
     await sleep(1_100); // FEEDER_LEASE_SEC=1
+    const res = await push(server, TRAINEE, [target("SIM2"), target("SIM3")]);
 
-    const res = await push(server, TRAINEE, [target("SIM1"), target("SIM2")]);
-    assert.equal(res.statusCode, 200, "the session keeps going under a new feeder");
-
-    // And the new feeder now holds it against the old one.
-    assert.equal((await push(server, INSTRUCTOR, [target("SIM1")])).statusCode, 409);
+    assert.equal(res.json().feeders, 1);
+    assert.equal(res.json().inScope, 2, "SIM1 is in nobody's picture any more");
+    assert.ok(snapshot()["SIM1"], "but it is held through the grace period, not released on the spot");
   });
 });
