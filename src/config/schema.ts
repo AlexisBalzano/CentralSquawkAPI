@@ -17,6 +17,17 @@ export interface AorConfig {
   entryRingNm: number;
   /** Distance outside the AOR at which a code is released. */
   zonePaddingNm: number;
+  /**
+   * How far the border band reaches inside the AOR. The band runs from here out
+   * to the entry ring; 0 starts it at the boundary itself.
+   */
+  borderInsetNm: number;
+  /**
+   * Below this altitude, in feet, a new flight in the border band is left alone
+   * until it climbs or reaches the core. Low traffic near the boundary is
+   * usually a neighbouring unit's departure or arrival, not ours.
+   */
+  borderMinAltitudeFt: number;
 }
 
 export interface CodesConfig {
@@ -154,6 +165,8 @@ export function parseConfig(input: unknown): RawConfig {
     firs: c.stringList(aorRaw["firs"], "config.aor.firs"),
     entryRingNm: c.number(aorRaw["entryRingNm"], "config.aor.entryRingNm", 0, 500),
     zonePaddingNm: c.number(aorRaw["zonePaddingNm"], "config.aor.zonePaddingNm", 0, 2000),
+    borderInsetNm: c.number(aorRaw["borderInsetNm"], "config.aor.borderInsetNm", 0, 100),
+    borderMinAltitudeFt: c.number(aorRaw["borderMinAltitudeFt"], "config.aor.borderMinAltitudeFt", 0, 60_000),
   };
   if (aor.firs.length === 0) c.fail("config.aor.firs: at least one FIR is required");
   if (aor.zonePaddingNm <= aor.entryRingNm) {

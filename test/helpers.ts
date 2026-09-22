@@ -6,7 +6,7 @@ import { PoolRegistry } from "../src/domain/pools.js";
 import type { Observation } from "../src/domain/types.js";
 import { Area } from "../src/geo.js";
 import type { Navdata } from "../src/navdata/navdata.js";
-import type { CodeRange, RawConfig } from "../src/config/schema.js";
+import type { AorConfig, CodeRange, RawConfig } from "../src/config/schema.js";
 import type { FeedResult } from "../src/vatsim/datafeed.js";
 
 /** A square covering roughly northern France, in GeoJSON [lon, lat] order. */
@@ -27,10 +27,25 @@ export function range(from: string, to: string, destinations = ["*"]): CodeRange
   return { from, to, destinations };
 }
 
-export function makeConfig(ranges: CodeRange[], exclusions: string[] = []): ConfigSnapshot {
+/**
+ * The border band is on by default, as it is in production, so every other test
+ * also proves it leaves ordinary traffic deep inside the square alone.
+ */
+export function makeConfig(
+  ranges: CodeRange[],
+  exclusions: string[] = [],
+  aor: Partial<AorConfig> = {},
+): ConfigSnapshot {
   const raw: RawConfig = {
     version: 2,
-    aor: { firs: ["LFFF"], entryRingNm: 40, zonePaddingNm: 100 },
+    aor: {
+      firs: ["LFFF"],
+      entryRingNm: 40,
+      zonePaddingNm: 100,
+      borderInsetNm: 10,
+      borderMinAltitudeFt: 10_000,
+      ...aor,
+    },
     codes: {
       default: ["0000", "1200", "1234", "2000", "7000"],
       conspicuity: "1000",
