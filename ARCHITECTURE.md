@@ -151,7 +151,7 @@ correspondingly less time.
 | `src/env.ts` | Process environment. Operational knobs only |
 | `src/server.ts` | Fastify instance and every route |
 | `src/auth.ts` | Controller token and GitHub webhook signature |
-| `src/geo.ts` | Point-in-polygon, distance-to-edge, `Area` |
+| `src/geo.ts` | Point-in-polygon, distance to an area's outline, `Area` |
 | `src/config/schema.ts` | Config shape and its validator |
 | `src/config/loader.ts` | Assembles a whole snapshot, all-or-nothing |
 | `src/domain/types.ts` | Domain types |
@@ -200,6 +200,48 @@ assigned one".
 The tick is idempotent: running it twice against the same feed produces no
 changes on the second pass. This is worth preserving — it is the cheapest
 possible check that the loop has no hidden state.
+
+### The border band
+
+The plugin writes the central code into any flight nobody is tracking. That is
+right for a flight in French airspace and wrong for one a neighbouring unit is
+still working, and low traffic near the boundary is mostly the second kind.
+Geneva's runway is 0.2 NM outside the AOR, so without a guard its departures
+were given a French code on the takeoff roll, and every French plugin wrote it
+into them while Geneva was still handing them from tower to approach.
+
+So a new flight enters scope on one of two terms, depending on where it is:
+
+| Layer | Where | Enters scope when |
+| --- | --- | --- |
+| Core | Inside the AOR by at least `borderInsetNm` | Airborne, as before |
+| Border band | From there out to `entryRingNm` | Airborne, and at or above `borderMinAltitudeFt` |
+
+It gates adoption as well as allocation, because an adopted code is published
+and written just the same. It remembers nothing: a held flight is asked again
+every tick and enters scope the tick it climbs through the floor or crosses into
+the core, so the tick stays idempotent. `held=` on the tick line, and
+`lastTick.heldAtBorder` on `/health`, count the flights it kept out.
+
+What it deliberately leaves alone:
+
+- **A flight already in the map.** The band decides entry, not release. A French
+  departure descending towards a foreign aerodrome keeps its code until it lands
+  or leaves the padded zone.
+- **Observation.** Held flights are inside the padded zone, so the codes they
+  squawk are still reserved in phase 2 and they still take part in DUPE
+  detection. That is why the gate sits in phase 3.
+- **A controller's request.** Manual operations are never gated.
+
+**The inset is measured from the outline of the AOR, not from the nearest ring
+edge.** `config.aor.firs` matches the five FIRs *and* the France UIR, which
+carries the id `LFFF` too, so most FIR edges are seams through the middle of the
+country. Measured to those, Clermont-Ferrand sits 7 NM from the border rather
+than 118, and its departures would be held at any inset above that. `Area` cuts
+every ring edge wherever another crosses or joins it, and keeps the pieces with
+the inside on one side and the outside on the other. From outside that is
+exactly the distance it always measured; from inside it is the depth into
+France. It is built on first use, in about 15 ms on the real geometry.
 
 ### Warm-up
 
@@ -479,7 +521,11 @@ Break any of these and the service will still appear to work.
    Anything that weakens this — trusting a client's claim about its own mode,
    failing open when the roster is missing — puts invented traffic in the real
    map holding real codes.
-10. **A push replaces its client's picture, and a quiet client's picture
+10. **The border band gates classification, never observation.** A held flight
+    must stay in the observation set. Filtered out in phase 1, the code it is
+    squawking would no longer be reserved, and the pool would hand it to
+    someone else: a DUPE the server invented.
+11. **A push replaces its client's picture, and a quiet client's picture
     lapses.** A merge that only ever added would keep every flight any client
     had ever seen: nothing would be released, and the map would fill with
     aircraft that left the session hours ago.
@@ -499,5 +545,12 @@ Break any of these and the service will still appear to work.
   fixes; name-based resolution will occasionally judge a point inside because a
   same-named fix elsewhere is. This biases toward granting 1000, the opposite
   direction from every other fail-closed choice here.
+- **Delegated airspace deeper than the inset.** The Channel Islands sit inside
+  the Brest FIR polygon (EGJJ 44 NM in, EGJB 27 NM), so Jersey's departures are
+  core traffic and still get a code on the takeoff roll. No sane inset reaches
+  them; they would need a carve-out of their own.
+- **French aerodromes in the band are held like foreign ones.** An inset of
+  2 NM or more puts LFSB and LFLI in the band, and 10 NM adds LFST, LFQQ, LFGA
+  and LFKF. Their departures wait for the floor, or for a controller to ask.
 - **No tests yet.** The tick's idempotence and the reserve-before-allocate
   ordering are the two things most worth covering first.

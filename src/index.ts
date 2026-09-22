@@ -197,6 +197,7 @@ async function main(): Promise<void> {
           adopted: stats.adopted,
           released: stats.released,
           dupes: stats.dupes,
+          heldAtBorder: stats.heldAtBorder,
           feedAgeMs: lag,
           askLagMs: askLag,
           lagFloorMs: pipelineLagMs,

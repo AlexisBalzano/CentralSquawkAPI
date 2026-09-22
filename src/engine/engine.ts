@@ -70,6 +70,8 @@ export interface TickStats {
   wildcard: number;
   exhausted: number;
   conspicuity: number;
+  /** New flights left alone because they were low in the border band. */
+  heldAtBorder: number;
   durationMs: number;
 }
 
@@ -287,6 +289,7 @@ export class Engine {
     // ---- Phase 3: classify ------------------------------------------------
     const queue: Observation[] = [];
     let adopted = 0;
+    let heldAtBorder = 0;
 
     for (const obs of inScope) {
       const existing = this.assignments.get(obs.callsign);
@@ -309,6 +312,20 @@ export class Engine {
       if (!airborne) continue; // ground traffic is controller request only
       if (obs.flightRules !== "I") continue; // VFR and no-flight-plan on request only
       if (!aor.withinNm(obs.latitude, obs.longitude, raw.aor.entryRingNm)) continue;
+
+      // The border band. Low and near the boundary, a flight is far more likely
+      // a neighbouring unit's departure or arrival than ours, and the plugin
+      // writes the central code into any flight nobody is tracking -- mid-handoff
+      // between two foreign controllers included. So it is not taken, adopted
+      // or allocated, until it climbs through the floor or reaches the core.
+      // Nothing is remembered: the next tick simply asks again.
+      if (
+        obs.altitude < raw.aor.borderMinAltitudeFt &&
+        !aor.insideByNm(obs.latitude, obs.longitude, raw.aor.borderInsetNm)
+      ) {
+        heldAtBorder++;
+        continue;
+      }
 
       if (codeBook.isEmergency(obs.transponder)) {
         // Never touched, but recorded so the code is visible and never reissued.
@@ -424,7 +441,7 @@ export class Engine {
       "tick",
       `observed=${feed.observations.length} scope=${inScope.length} ` +
         `assigned=${assigned} (1000=${conspicuity}) adopted=${adopted} ` +
-        `released=${released} dupes=${dupes}` +
+        `released=${released} dupes=${dupes} held=${heldAtBorder}` +
         `${exhausted > 0 ? ` EXHAUSTED=${exhausted}` : ""}` +
         `${this.ready ? "" : " (warming up)"} ${Date.now() - started}ms`,
     );
@@ -441,6 +458,7 @@ export class Engine {
       wildcard,
       exhausted,
       conspicuity,
+      heldAtBorder,
       durationMs: Date.now() - started,
     };
     return this.lastTick;
