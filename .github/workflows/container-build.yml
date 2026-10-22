@@ -9,6 +9,8 @@ on:
   pull_request:
     branches:
       - "main"
+  # So an image can be rebuilt (e.g. for a base-image security fix) without an empty commit.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
